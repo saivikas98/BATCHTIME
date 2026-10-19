@@ -1,157 +1,452 @@
+"""PDF parsers for the EB Execution Date Streamlit application.
+
+Supported report types:
+1. System Integrity Report
+2. Batch Cycle Report
+3. PFS Filling Report
+
+The parser extracts only execution-date information required by the reference
+workbook. It does not store uploaded PDFs or invent missing timestamps.
+"""
+
 from __future__ import annotations
-import io, re
-from dataclasses import dataclass
+
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
-import fitz
+from typing import Any, BinaryIO
+
+import fitz  # PyMuPDF
 import pandas as pd
 
-DT=r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}"
-DT_FMT="%d/%m/%Y %H:%M:%S"
 
-def _dt(x):
-    try: return datetime.strptime(x.strip(), DT_FMT)
-    except Exception: return pd.NaT
+DATE_TIME_FORMAT = "%d/%m/%Y %H:%M:%S"
+DATE_TIME_PATTERN = r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}"
+BATCH_PATTERN = r"[A-Z]{2}\d{5}"
 
-def _open_pdf(data):
-    if isinstance(data,(str,Path)): return fitz.open(str(data))
-    if hasattr(data,'getvalue'): data=data.getvalue()
-    if hasattr(data,'read'): data=data.read()
-    return fitz.open(stream=data,filetype='pdf')
+REPORT_SYSTEM_INTEGRITY = "System Integrity Report"
+REPORT_BATCH_CYCLE = "Batch Cycle Report"
+REPORT_PFS_FILLING = "PFS Filling Report"
+REPORT_UNKNOWN = "Unknown Report"
 
-def _page_text(doc,n): return doc.load_page(n).get_text('text',sort=True)
+OUTPUT_COLUMNS = [
+    "Stage",
+    "Machine",
+    "Process Start",
+    "Process End",
+    "Duration (hours)",
+    "Index",
+    "Total",
+    "Source",
+    "Validation",
+]
 
-def detect_report(text):
-    u=text.upper()
-    if 'BATCH CYCLE REPORT' in u: return 'Batch Cycle Report'
-    if 'EQUIPMENT ID:' in u and ('PRODUCTION COUNTERS' in u or 'ACTIVE RECIPE' in u): return 'PFS Filling Report'
-    if any(k in u for k in ['SEAL DRY RUN','LEAK TEST','VACUUM TEST']): return 'System Integrity Report'
-    return 'Unknown'
 
-def extract_batch_no(text,name=''):
-    pats=[r'Batch\s*(?:no\.?|number)\s*[:.]?\s*([A-Z]{2}\d{5})',r'\b([A-Z]{2}\d{5})\b']
-    for p in pats:
-        m=re.search(p,text,re.I)
-        if m:return m.group(1).upper()
-    m=re.search(r'([A-Z]{2}\d{5})',name,re.I)
-    return m.group(1).upper() if m else 'UNKNOWN'
+def _empty_rows() -> pd.DataFrame:
+    """Return an empty result table with a stable schema."""
+    return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-def _pair(label,start,end,machine='',source='',confidence='High'):
-    s,e=_dt(start),_dt(end)
-    return {'Stage':label,'Machine':machine,'Start':s,'End':e,'Duration_hours':round((e-s).total_seconds()/3600,4) if pd.notna(s) and pd.notna(e) else None,'Source':source,'Confidence':confidence}
 
-def parse_overview(text):
-    rows=[]
-    # Matches the report's Process Overview lines, including machine names with spaces and extruder number.
-    p=re.compile(r'(?m)^\s*(API Charge|Water Charge|Wetting|Premixing|Mixing|Blending)\s+(API Charge|Water Charge|Mixing Extruder\s*[123])\s+('+DT+r')\s+('+DT+r')\s+\d+\s+\d+\s*$' ,re.I)
-    # Python regex cannot accept the accidental markdown-style terminator above; built below explicitly.
-    for m in p.finditer(text):
-        proc,mach,st,en=m.groups()
-        rows.append((proc.title().replace('Premixing','Pre-mixing'),re.sub(r'\s+',' ',mach).title(),st,en))
-    return rows
+def _to_datetime(value: str) -> datetime:
+    """Convert report date text to a Python datetime."""
+    return datetime.strptime(value.strip(), DATE_TIME_FORMAT)
 
-def parse_cycle(data,name=''):
-    doc=_open_pdf(data)
-    first='\n'.join(_page_text(doc,i) for i in range(min(3,len(doc))))
-    batch=extract_batch_no(first,name)
-    product=''
-    m=re.search(r'Product name\s*[:*]*\s*([^\n*]+)',first,re.I)
-    if m: product=m.group(1).strip()
-    overview=parse_overview(first)
-    out=[]
-    charge_groups={'Water charging':[],'API charging':[]}
-    for proc,mach,st,en in overview:
-        stage={'Water Charge':'Water charging','Api Charge':'API charging','Wetting':'Wetting','Pre-Mixing':'Pre-mixing','Mixing':'Mixing','Blending':'Blending'}.get(proc,proc)
-        if stage in charge_groups:
-            charge_groups[stage].append((_dt(st),_dt(en)))
-        else:
-            out.append(_pair(stage,st,en,mach,'Process Overview'))
-    for stage,pairs in charge_groups.items():
-        if pairs:
-            s0=min(x[0] for x in pairs); e0=max(x[1] for x in pairs)
-            out.append({'Stage':stage,'Machine':stage,'Start':s0,'End':e0,'Duration_hours':round((e0-s0).total_seconds()/3600,4),'Source':'Process Overview - min start/max end','Confidence':'High'})
-    # Blending phase boundaries from the authoritative BLENDING DATALOG step transitions.
-    blend_rows=[]
-    dtre=re.compile(r'^\s*('+DT+r')\s+(.+?)\s{2,}',re.M)
-    for i in range(2,len(doc)):
-        t=_page_text(doc,i)
-        if 'BLENDING DATALOG' not in t.upper(): continue
-        for m in dtre.finditer(t):
-            step=re.sub(r'\s+',' ',m.group(2)).strip()
-            blend_rows.append((_dt(m.group(1)),step))
-    blend_rows=[x for x in blend_rows if pd.notna(x[0])]
-    blend_rows.sort(key=lambda x:x[0])
-    b=[r for r in out if r['Stage']=='Blending']
-    if b and blend_rows:
-        bs,be=b[0]['Start'],b[0]['End']
-        def last_of(term,lo=None,hi=None):
-            xs=[d for d,s in blend_rows if term.lower() in s.lower() and (lo is None or d>=lo) and (hi is None or d<=hi)]
-            return max(xs) if xs else None
-        first_sample=min([d for d,s in blend_rows if 'sample: ips ph' in s.lower()],default=None)
-        pre_end=last_of('Blending to accumulator',bs,first_sample) if first_sample else None
-        # First sample block ends immediately before first Adjust PH row.
-        first_adjust=min([d for d,s in blend_rows if 'adjust ph' in s.lower()],default=None)
-        sample1_end=last_of('Sample: IPS PH',pre_end,first_adjust) if pre_end else None
-        adjust_end=last_of('Adjust PH',first_adjust,be) if first_adjust else None
-        # Second sample starts after final blending-to-accumulator block.
-        second_blend_end=last_of('Blending to accumulator',adjust_end,be) if adjust_end else None
-        phases=[('Pre-pH Blending',bs,pre_end),('pH sample',pre_end,sample1_end),('pH adjustment',sample1_end,adjust_end),('Post-pH blending',adjust_end,second_blend_end),('pH sample',second_blend_end,be)]
-        out=[r for r in out if r['Stage']!='Blending']
-        for label,s,e in phases:
-            if s and e: out.append({'Stage':label,'Machine':'Mixing Extruder 1','Start':s,'End':e,'Duration_hours':round((e-s).total_seconds()/3600,4),'Source':'Blending Datalog','Confidence':'High'})
-    doc.close()
-    return {'batch_no':batch,'product':product,'report_type':'Batch Cycle Report','rows':pd.DataFrame(out)}
 
-def parse_pfs(data,name=''):
-    doc=_open_pdf(data); text='\n'.join(_page_text(doc,i) for i in range(min(8,len(doc))))
-    batch=extract_batch_no(text,name)
-    def one(label):
-        m=re.search(label+r'\s*:\s*('+DT+r')',text,re.I); return _dt(m.group(1)) if m else pd.NaT
-    s,e=one('Batch Start Time'),one('Batch End Time')
-    product=''; m=re.search(r'Product Name\s*:\s*([^\n]+)',text,re.I)
-    if m: product=m.group(1).strip()
-    counters={}
-    m=re.search(r'Production Counters:\s*\n?\s*Infeed \(pcs\)\s+Outfeed \(pcs\)\s+Reject \(pcs\)\s*\n?\s*(\d+)\s+(\d+)\s+(\d+)',text,re.I)
-    if m: counters=dict(Infeed=int(m.group(1)),Outfeed=int(m.group(2)),Reject=int(m.group(3)))
-    doc.close()
-    rows=pd.DataFrame([{'Stage':'Filling','Machine':'PFS Filling Line','Start':s,'End':e,'Duration_hours':round((e-s).total_seconds()/3600,4) if pd.notna(s) and pd.notna(e) else None,'Source':'PFS Batch Header','Confidence':'High'}])
-    return {'batch_no':batch,'product':product,'report_type':'PFS Filling Report','rows':rows,'counters':counters}
+def _normalise_space(value: str) -> str:
+    """Replace line breaks and repeated spaces with a single space."""
+    return re.sub(r"\s+", " ", value).strip()
 
-def parse_integrity(data,name=''):
-    doc=_open_pdf(data); batch='UNKNOWN'; rows=[]
-    keys=[('Seal dry run','seal dry run'),('Leak test','leak test'),('Vacuum test (Max)','vacuum test')]
-    for i in range(len(doc)):
-        t=_page_text(doc,i); batch=extract_batch_no(t,name) if batch=='UNKNOWN' else batch
-        for label,key in keys:
-            if key not in t.lower(): continue
-            dts=re.findall(DT,t)
-            if len(dts)>=2: rows.append(_pair(label,dts[0],dts[-1],f'Integrity unit {len([r for r in rows if r["Stage"]==label])+1}',f'Page {i+1}','Medium'))
-    doc.close(); return {'batch_no':batch,'report_type':'System Integrity Report','rows':pd.DataFrame(rows)}
 
-def parse_pdf(data,name=''):
-    doc=_open_pdf(data); probe='\n'.join(_page_text(doc,i) for i in range(min(8,len(doc)))); doc.close()
-    k=detect_report(probe)
-    if k=='Batch Cycle Report': return parse_cycle(data,name)
-    if k=='PFS Filling Report': return parse_pfs(data,name)
-    return parse_integrity(data,name)
+def _read_pdf_bytes(source: Any) -> bytes:
+    """Read PDF bytes from Streamlit uploads, file paths, or file-like objects."""
+    if isinstance(source, (str, Path)):
+        return Path(source).read_bytes()
 
-def build_execution_table(parsed):
-    by={}
-    for x in parsed: by.setdefault(x['batch_no'],[]).append(x)
-    outputs=[]
-    for batch,reps in by.items():
-        chunks=[r['rows'] for r in reps if not r['rows'].empty]
-        if not chunks: continue
-        df=pd.concat(chunks,ignore_index=True)
-        # Filling setup is the gap from batch-cycle end to PFS start.
-        cycle=[r for r in reps if r['report_type']=='Batch Cycle Report']
-        pfs=[r for r in reps if r['report_type']=='PFS Filling Report']
-        if cycle and pfs:
-            cdf,pdf=cycle[0]['rows'],pfs[0]['rows']
-            cend=cdf['End'].max(); pstart=pdf.iloc[0]['Start']
-            if pd.notna(cend) and pd.notna(pstart):
-                gap=pd.DataFrame([{'Stage':'Filling setup','Machine':'Inter-report gap','Start':cend,'End':pstart,'Duration_hours':round((pstart-cend).total_seconds()/3600,4),'Source':'Calculated: cycle end to PFS start','Confidence':'High'}])
-                df=pd.concat([df,gap],ignore_index=True)
-        df.insert(0,'Batch',batch); outputs.append(df.sort_values(['Start','Stage'],na_position='last'))
-    return pd.concat(outputs,ignore_index=True) if outputs else pd.DataFrame()
+    if isinstance(source, bytes):
+        return source
+
+    if hasattr(source, "getvalue"):
+        return source.getvalue()
+
+    if hasattr(source, "read"):
+        current_position = None
+        if hasattr(source, "tell"):
+            current_position = source.tell()
+        data = source.read()
+        if current_position is not None and hasattr(source, "seek"):
+            source.seek(current_position)
+        return data
+
+    raise TypeError("Unsupported PDF input type.")
+
+
+def _open_pdf(source: Any) -> fitz.Document:
+    """Open a PDF from memory without writing uploaded content to disk."""
+    return fitz.open(stream=_read_pdf_bytes(source), filetype="pdf")
+
+
+def _extract_pages_text(document: fitz.Document, page_count: int) -> str:
+    """Extract sorted text from the first requested pages."""
+    text_parts: list[str] = []
+    for page_number in range(min(page_count, len(document))):
+        text_parts.append(document.load_page(page_number).get_text("text", sort=True))
+    return "\n".join(text_parts)
+
+
+def _extract_batch_number(text: str, file_name: str = "") -> str:
+    """Extract the batch number from report text, then fall back to the name."""
+    labelled_match = re.search(
+        rf"Batch\s*(?:no\.?|number)?\s*[:.]?\s*({BATCH_PATTERN})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if labelled_match:
+        return labelled_match.group(1).upper()
+
+    file_name_match = re.search(BATCH_PATTERN, file_name, flags=re.IGNORECASE)
+    if file_name_match:
+        return file_name_match.group(0).upper()
+
+    generic_match = re.search(BATCH_PATTERN, text, flags=re.IGNORECASE)
+    if generic_match:
+        return generic_match.group(0).upper()
+
+    return "UNKNOWN"
+
+
+def _build_row(
+    stage: str,
+    machine: str,
+    start_text: str,
+    end_text: str,
+    source: str,
+    execution_index: int | None = None,
+    execution_total: int | None = None,
+) -> dict[str, Any]:
+    """Create one validated execution record."""
+    start_time = _to_datetime(start_text)
+    end_time = _to_datetime(end_text)
+    duration_hours = (end_time - start_time).total_seconds() / 3600
+
+    return {
+        "Stage": stage,
+        "Machine": machine,
+        "Process Start": start_time,
+        "Process End": end_time,
+        "Duration (hours)": round(duration_hours, 4),
+        "Index": execution_index,
+        "Total": execution_total,
+        "Source": source,
+        "Validation": "OK" if end_time >= start_time else "End before start",
+    }
+
+
+def detect_report_type(source: Any) -> str:
+    """Identify the uploaded report using text from its first pages."""
+    with _open_pdf(source) as document:
+        probe_text = _extract_pages_text(document, 8).upper()
+
+    if "SYSTEM INTEGRITY REPORT" in probe_text:
+        return REPORT_SYSTEM_INTEGRITY
+
+    if "BATCH START TIME" in probe_text and (
+        "PRODUCTION COUNTERS" in probe_text or "EQUIPMENT ID" in probe_text
+    ):
+        return REPORT_PFS_FILLING
+
+    if "PROCESS OVERVIEW" in probe_text and any(
+        marker in probe_text
+        for marker in ("WETTING", "PREMIXING", "MIXING EXTRUDER")
+    ):
+        return REPORT_BATCH_CYCLE
+
+    return REPORT_UNKNOWN
+
+
+def parse_system_integrity_report(
+    source: Any,
+    file_name: str = "",
+) -> dict[str, Any]:
+    """Extract Dryrun, Leak Test, and Vacuum Test Process Overview rows."""
+    with _open_pdf(source) as document:
+        overview_text = _extract_pages_text(document, 2)
+
+    batch_number = _extract_batch_number(overview_text, file_name)
+    normalised_text = _normalise_space(overview_text)
+
+    process_pattern = re.compile(
+        rf"(Dryrun|Leak\s*Test|Vacuum\s*Test)\s+"
+        rf"(Mixing\s*Extruder\s*[123])\s+"
+        rf"({DATE_TIME_PATTERN})\s+"
+        rf"({DATE_TIME_PATTERN})\s+"
+        rf"(\d+)\s+(\d+)",
+        flags=re.IGNORECASE,
+    )
+
+    stage_names = {
+        "dryrun": "Seal dry run",
+        "leak test": "Leak test",
+        "vacuum test": "Vacuum test (Max)",
+    }
+
+    rows: list[dict[str, Any]] = []
+    for match in process_pattern.finditer(normalised_text):
+        raw_process = _normalise_space(match.group(1)).lower()
+        machine = _normalise_space(match.group(2)).title()
+
+        rows.append(
+            _build_row(
+                stage=stage_names[raw_process],
+                machine=machine,
+                start_text=match.group(3),
+                end_text=match.group(4),
+                source="System Integrity Process Overview",
+                execution_index=int(match.group(5)),
+                execution_total=int(match.group(6)),
+            )
+        )
+
+    result_rows = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    return {
+        "Batch": batch_number,
+        "Report Type": REPORT_SYSTEM_INTEGRITY,
+        "Rows": result_rows,
+    }
+
+
+def parse_pfs_filling_report(
+    source: Any,
+    file_name: str = "",
+) -> dict[str, Any]:
+    """Extract the filling interval and available production counters."""
+    with _open_pdf(source) as document:
+        header_text = _extract_pages_text(document, 8)
+
+    batch_number = _extract_batch_number(header_text, file_name)
+
+    start_match = re.search(
+        rf"Batch Start Time\s*:\s*({DATE_TIME_PATTERN})",
+        header_text,
+        flags=re.IGNORECASE,
+    )
+    end_match = re.search(
+        rf"Batch End Time\s*:\s*({DATE_TIME_PATTERN})",
+        header_text,
+        flags=re.IGNORECASE,
+    )
+
+    rows: list[dict[str, Any]] = []
+    if start_match and end_match:
+        rows.append(
+            _build_row(
+                stage="Filling",
+                machine="PFS Filling Line",
+                start_text=start_match.group(1),
+                end_text=end_match.group(1),
+                source="PFS batch header",
+            )
+        )
+
+    counters: dict[str, int] = {}
+    counter_match = re.search(
+        r"Production Counters:\s*"
+        r"Infeed\s*\(pcs\)\s+Outfeed\s*\(pcs\)\s+Reject\s*\(pcs\)\s*"
+        r"(\d+)\s+(\d+)\s+(\d+)",
+        _normalise_space(header_text),
+        flags=re.IGNORECASE,
+    )
+    if counter_match:
+        counters = {
+            "Infeed": int(counter_match.group(1)),
+            "Outfeed": int(counter_match.group(2)),
+            "Reject": int(counter_match.group(3)),
+        }
+
+    return {
+        "Batch": batch_number,
+        "Report Type": REPORT_PFS_FILLING,
+        "Rows": pd.DataFrame(rows, columns=OUTPUT_COLUMNS),
+        "Counters": counters,
+    }
+
+
+def parse_batch_cycle_report(
+    source: Any,
+    file_name: str = "",
+) -> dict[str, Any]:
+    """Extract execution intervals from the Batch Cycle Process Overview."""
+    with _open_pdf(source) as document:
+        overview_text = _extract_pages_text(document, 4)
+
+    batch_number = _extract_batch_number(overview_text, file_name)
+    normalised_text = _normalise_space(overview_text)
+
+    process_pattern = re.compile(
+        rf"(API\s*Charge|Water\s*Charge|Wetting|Premixing|Mixing|Blending)\s+"
+        rf"(API\s*Charge|Water\s*Charge|Mixing\s*Extruder\s*[123])\s+"
+        rf"({DATE_TIME_PATTERN})\s+"
+        rf"({DATE_TIME_PATTERN})\s+"
+        rf"(\d+)\s+(\d+)",
+        flags=re.IGNORECASE,
+    )
+
+    stage_names = {
+        "api charge": "API charging",
+        "water charge": "Water charging",
+        "wetting": "Wetting",
+        "premixing": "Pre-mixing",
+        "mixing": "Mixing",
+        "blending": "Blending",
+    }
+
+    extracted_rows: list[dict[str, Any]] = []
+    for match in process_pattern.finditer(normalised_text):
+        raw_process = _normalise_space(match.group(1)).lower()
+        machine = _normalise_space(match.group(2)).title()
+
+        extracted_rows.append(
+            _build_row(
+                stage=stage_names[raw_process],
+                machine=machine,
+                start_text=match.group(3),
+                end_text=match.group(4),
+                source="Batch Process Overview",
+                execution_index=int(match.group(5)),
+                execution_total=int(match.group(6)),
+            )
+        )
+
+    rows: list[dict[str, Any]] = []
+
+    # The reference workbook represents charging stages as elapsed windows,
+    # from the earliest matching cycle start to the latest matching cycle end.
+    for charging_stage in ("Water charging", "API charging"):
+        matching_rows = [
+            row for row in extracted_rows if row["Stage"] == charging_stage
+        ]
+        if matching_rows:
+            start_time = min(row["Process Start"] for row in matching_rows)
+            end_time = max(row["Process End"] for row in matching_rows)
+            rows.append(
+                {
+                    "Stage": charging_stage,
+                    "Machine": charging_stage,
+                    "Process Start": start_time,
+                    "Process End": end_time,
+                    "Duration (hours)": round(
+                        (end_time - start_time).total_seconds() / 3600,
+                        4,
+                    ),
+                    "Index": None,
+                    "Total": len(matching_rows),
+                    "Source": "Minimum start to maximum end of Process Overview",
+                    "Validation": "OK",
+                }
+            )
+
+    rows.extend(
+        row
+        for row in extracted_rows
+        if row["Stage"] not in {"Water charging", "API charging"}
+    )
+
+    return {
+        "Batch": batch_number,
+        "Report Type": REPORT_BATCH_CYCLE,
+        "Rows": pd.DataFrame(rows, columns=OUTPUT_COLUMNS),
+    }
+
+
+def parse_pdf(source: Any, file_name: str = "") -> dict[str, Any]:
+    """Detect the report type and route it to the correct parser."""
+    report_type = detect_report_type(source)
+
+    if report_type == REPORT_SYSTEM_INTEGRITY:
+        return parse_system_integrity_report(source, file_name)
+
+    if report_type == REPORT_BATCH_CYCLE:
+        return parse_batch_cycle_report(source, file_name)
+
+    if report_type == REPORT_PFS_FILLING:
+        return parse_pfs_filling_report(source, file_name)
+
+    return {
+        "Batch": _extract_batch_number("", file_name),
+        "Report Type": REPORT_UNKNOWN,
+        "Rows": _empty_rows(),
+        "Error": "Unsupported report layout.",
+    }
+
+
+def combine_reports(reports: list[dict[str, Any]]) -> pd.DataFrame:
+    """Combine extracted records and calculate the Filling setup interval."""
+    combined_batches: list[pd.DataFrame] = []
+    batch_numbers = sorted({report["Batch"] for report in reports})
+
+    for batch_number in batch_numbers:
+        batch_reports = [
+            report for report in reports if report["Batch"] == batch_number
+        ]
+        available_tables = [
+            report["Rows"]
+            for report in batch_reports
+            if not report["Rows"].empty
+        ]
+
+        if not available_tables:
+            continue
+
+        batch_table = pd.concat(available_tables, ignore_index=True)
+
+        cycle_reports = [
+            report
+            for report in batch_reports
+            if report["Report Type"] == REPORT_BATCH_CYCLE
+            and not report["Rows"].empty
+        ]
+        filling_reports = [
+            report
+            for report in batch_reports
+            if report["Report Type"] == REPORT_PFS_FILLING
+            and not report["Rows"].empty
+        ]
+
+        if cycle_reports and filling_reports:
+            cycle_end = cycle_reports[0]["Rows"]["Process End"].max()
+            filling_start = filling_reports[0]["Rows"]["Process Start"].min()
+
+            if pd.notna(cycle_end) and pd.notna(filling_start):
+                if filling_start >= cycle_end:
+                    setup_row = {
+                        "Stage": "Filling setup",
+                        "Machine": "Inter-report gap",
+                        "Process Start": cycle_end,
+                        "Process End": filling_start,
+                        "Duration (hours)": round(
+                            (filling_start - cycle_end).total_seconds() / 3600,
+                            4,
+                        ),
+                        "Index": None,
+                        "Total": None,
+                        "Source": "Batch-cycle end to PFS filling start",
+                        "Validation": "OK",
+                    }
+                    batch_table = pd.concat(
+                        [batch_table, pd.DataFrame([setup_row])],
+                        ignore_index=True,
+                    )
+
+        batch_table.insert(0, "Batch", batch_number)
+        combined_batches.append(batch_table)
+
+    if not combined_batches:
+        return pd.DataFrame(columns=["Batch", *OUTPUT_COLUMNS])
+
+    return (
+        pd.concat(combined_batches, ignore_index=True)
+        .sort_values(
+            by=["Batch", "Process Start", "Stage", "Machine"],
+            na_position="last",
+        )
+        .reset_index(drop=True)
+    )
