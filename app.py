@@ -484,10 +484,18 @@ def main() -> None:
         extraction_log["Status"].eq("Validation warning")
     ]
     if not validation_warnings.empty:
+        # Display the actual parser diagnostic. The previous fixed banner said
+        # "missing cycle 60" for every type of warning, including a missing
+        # cycle-100 boundary or another downstream transition.
+        warning_lines = []
+        for _, warning_row in validation_warnings.iterrows():
+            warning_lines.append(
+                f"{warning_row['File']} | Batch {warning_row['Batch']}: "
+                f"{warning_row['Message']}"
+            )
         st.warning(
-            "Blending validation warning: one or more reports are missing "
-            "cycle 60 or its completion marker. Affected phase durations are "
-            "left blank and are excluded from totals. Review Extraction Log."
+            "Blending validation warning:\n\n- "
+            + "\n- ".join(warning_lines)
         )
     actual = combine_reports(parsed_reports)
 
