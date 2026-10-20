@@ -200,11 +200,53 @@ def _overview_rows(text: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _find_blending_page_range(reader: PdfReader) -> list[int]:
+    """Locate the contiguous Blending Datalog section efficiently.
+
+    Large batch reports can exceed 2,000 pages. Scanning every page with
+    pypdf is slow. Probe every tenth page first, then expand around all hits.
+    """
+    page_count = len(reader.pages)
+    probe_step = 10
+    hits: list[int] = []
+    for page_index in range(0, page_count, probe_step):
+        text = _page_text(reader, page_index)
+        if "BLENDING DATALOG" in text.upper():
+            hits.append(page_index)
+
+    if not hits:
+        # Fallback for unusually short blending sections located between probes.
+        return list(range(page_count))
+
+    first_probe = max(0, min(hits) - probe_step)
+    last_probe = min(page_count - 1, max(hits) + probe_step)
+
+    first_page = first_probe
+    for page_index in range(first_probe, min(hits) + 1):
+        if "BLENDING DATALOG" in _page_text(reader, page_index).upper():
+            first_page = page_index
+            break
+
+    last_page = last_probe
+    for page_index in range(last_probe, max(hits) - 1, -1):
+        if "BLENDING DATALOG" in _page_text(reader, page_index).upper():
+            last_page = page_index
+            break
+
+    return list(range(first_page, last_page + 1))
+
+
 def _extract_blending_events(reader: PdfReader) -> pd.DataFrame:
-    """Extract only boundary-relevant rows from BLENDING DATALOG pages."""
+    """Extract boundary-relevant rows from Blending Datalog pages.
+
+    pypdf often extracts each table cell on a separate line, for example:
+    date, step, cycle, and measurements are separate newline tokens. Parsing
+    line-by-line therefore loses the cycle number. This parser splits the page
+    into complete records at each timestamp and reads the step and cycle from
+    the record block.
+    """
     events: list[dict[str, Any]] = []
     date_re = re.compile(DT_PATTERN)
-    cycle_re = re.compile(r"\b(\d{1,3})\b")
     known_steps = (
         "close 2mm orifice",
         "sample: ips ph",
@@ -214,29 +256,34 @@ def _extract_blending_events(reader: PdfReader) -> pd.DataFrame:
         "blending to accumulator right",
     )
 
-    for page_index in range(len(reader.pages)):
+    for page_index in _find_blending_page_range(reader):
         text = _page_text(reader, page_index)
         if "BLENDING DATALOG" not in text.upper():
             continue
 
-        # pypdf normally preserves each datalog record on a line. A fallback
-        # split at each date handles pages whose rows are concatenated.
-        lines = text.splitlines()
-        if not any(date_re.search(line) for line in lines):
-            lines = re.split(rf"(?={DT_PATTERN})", _clean(text))
-
-        for line in lines:
-            date_match = date_re.search(line)
-            if not date_match:
-                continue
-            lower = _clean(line).casefold()
-            step = next((item for item in known_steps if item in lower), None)
+        matches = list(date_re.finditer(text))
+        for record_index, date_match in enumerate(matches):
+            record_end = (
+                matches[record_index + 1].start()
+                if record_index + 1 < len(matches)
+                else len(text)
+            )
+            record = text[date_match.end():record_end]
+            clean_record = _clean(record)
+            lower_record = clean_record.casefold()
+            step = next(
+                (candidate for candidate in known_steps if candidate in lower_record),
+                None,
+            )
             if step is None:
                 continue
 
-            after_step = lower.split(step, 1)[1]
-            cycle_match = cycle_re.search(after_step)
+            # The cycle is the first integer token after the matched step name.
+            step_position = lower_record.find(step)
+            after_step = clean_record[step_position + len(step):]
+            cycle_match = re.search(r"(?:^|\s)(\d{1,3})(?=\s|$)", after_step)
             cycle = int(cycle_match.group(1)) if cycle_match else None
+
             events.append(
                 {
                     "Time": _date(date_match.group(0)),
@@ -255,7 +302,6 @@ def _extract_blending_events(reader: PdfReader) -> pd.DataFrame:
         .sort_values(["Time", "Page"])
         .reset_index(drop=True)
     )
-
 
 def _last_time(events: pd.DataFrame, mask: pd.Series) -> datetime | None:
     selected = events.loc[mask, "Time"]
