@@ -267,73 +267,6 @@ def _first_time(events: pd.DataFrame, mask: pd.Series) -> datetime | None:
     return selected.min() if not selected.empty else None
 
 
-
-def _validate_cycle_60(events: pd.DataFrame, blending_start: datetime, blending_end: datetime) -> dict[str, Any]:
-    """Validate that pre-pH cycle 60 and its completion marker are present.
-
-    Returns a structured result used both for extraction control and for
-    user-visible validation messages. Missing cycle 60 is treated as a hard
-    validation failure because the Pre-pH Blending endpoint cannot be proven.
-    """
-    window = events[
-        (events["Time"] >= blending_start) & (events["Time"] <= blending_end)
-    ].copy()
-    if window.empty:
-        return {
-            "ok": False,
-            "code": "BLEND_NO_DATALOG",
-            "message": "No Blending Datalog boundary rows were extracted.",
-            "cycle_60_end": None,
-        }
-
-    cycle = pd.to_numeric(window["Cycle"], errors="coerce")
-    cycle_60 = window[cycle.eq(60)].copy()
-    if cycle_60.empty:
-        return {
-            "ok": False,
-            "code": "BLEND_CYCLE_60_MISSING",
-            "message": (
-                "Cycle 60 is missing from the Blending Datalog. "
-                "Pre-pH Blending and downstream pH-phase durations were not calculated."
-            ),
-            "cycle_60_end": None,
-        }
-
-    close_60 = cycle_60[cycle_60["Step"].eq("close 2mm orifice")]
-    if not close_60.empty:
-        return {
-            "ok": True,
-            "code": "OK",
-            "message": "Cycle 60 completion validated using Close 2mm Orifice.",
-            "cycle_60_end": close_60["Time"].max(),
-        }
-
-    # Cycle 60 exists, but the preferred completion marker is absent. Use the
-    # final cycle-60 blending record as a transparent fallback and flag it.
-    blending_60 = cycle_60[
-        cycle_60["Step"].str.startswith("blending to accumulator")
-    ]
-    if not blending_60.empty:
-        return {
-            "ok": True,
-            "code": "BLEND_CYCLE_60_CLOSE_MISSING",
-            "message": (
-                "Cycle 60 exists, but Close 2mm Orifice is missing. "
-                "The final cycle-60 blending timestamp was used as a fallback."
-            ),
-            "cycle_60_end": blending_60["Time"].max(),
-        }
-
-    return {
-        "ok": False,
-        "code": "BLEND_CYCLE_60_COMPLETION_MISSING",
-        "message": (
-            "Cycle 60 was detected, but no valid cycle-60 completion row was found. "
-            "Pre-pH Blending and downstream pH-phase durations were not calculated."
-        ),
-        "cycle_60_end": None,
-    }
-
 def _blending_phase_rows(
     events: pd.DataFrame,
     blending_start: datetime,
@@ -352,13 +285,25 @@ def _blending_phase_rows(
     step = events["Step"]
     cycle = pd.to_numeric(events["Cycle"], errors="coerce")
 
-    # 1) Pre-pH blending ends only after cycle 60 has been validated.
-    cycle_60_validation = _validate_cycle_60(
-        events, blending_start, blending_end
+    # 1) Pre-pH blending ends when cycle 60 is completed. The screenshot shows
+    # Close 2mm Orifice at 23/09/2026 15:40:54, cycle 60.
+    pre_end = _last_time(
+        events,
+        step.eq("close 2mm orifice") & cycle.eq(60),
     )
-    if not cycle_60_validation["ok"]:
+    first_sample = _first_time(
+        events,
+        step.isin(["sample: ips ph", "sample ips ph"]),
+    )
+    if pre_end is None and first_sample is not None:
+        pre_end = _last_time(
+            events,
+            (events["Time"] < first_sample)
+            & cycle.eq(60)
+            & step.str.startswith("blending to accumulator"),
+        )
+    if pre_end is None:
         return []
-    pre_end = cycle_60_validation["cycle_60_end"]
 
     # 2) pH sample 1 runs from pre-pH completion through the final sampling
     # row immediately before the first Adjust PH row.
@@ -469,39 +414,22 @@ def parse_batch_cycle(source: Any, file_name: str = "") -> dict[str, Any]:
         blending_start = min(item["Process Start"] for item in blending_overview)
         blending_end = max(item["Process End"] for item in blending_overview)
         events = _extract_blending_events(reader)
-        cycle_60_validation = _validate_cycle_60(
-            events, blending_start, blending_end
-        )
         phase_rows = _blending_phase_rows(events, blending_start, blending_end)
         if phase_rows:
-            # Preserve a warning when the final cycle-60 blending row had to be
-            # used because Close 2mm Orifice was absent.
-            if cycle_60_validation["code"] != "OK":
-                for phase_row in phase_rows:
-                    if phase_row["Stage"] == "Pre-pH Blending":
-                        phase_row["Validation"] = cycle_60_validation["code"]
-                        phase_row["Source"] += " - fallback used"
             rows.extend(phase_rows)
         else:
-            # Preserve the overall interval but mark it invalid for phase-level
-            # calculations. The app will display this in the extraction log.
-            diagnostic = _row(
-                "Blending", "Blending", blending_start, blending_end,
-                f"Validation failure - {cycle_60_validation['message']}",
+            # Preserve the overall record and make the limitation visible.
+            rows.append(
+                _row(
+                    "Blending", "Blending", blending_start, blending_end,
+                    "Batch Process Overview - phase boundaries not detected",
+                )
             )
-            diagnostic["Validation"] = cycle_60_validation["code"]
-            rows.append(diagnostic)
 
-    warnings = [
-        str(value)
-        for value in pd.DataFrame(rows).get("Validation", pd.Series(dtype=str)).tolist()
-        if value not in ("OK", None, "")
-    ]
     return {
         "Batch": _batch_number(overview_text, file_name),
         "Report Type": BATCH,
         "Rows": pd.DataFrame(rows, columns=COLUMNS),
-        "Warnings": sorted(set(warnings)),
     }
 
 
