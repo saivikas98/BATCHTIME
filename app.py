@@ -213,12 +213,9 @@ def calculate_batch_values(
     # Backward compatibility for parser versions that expose one overall
     # Blending row instead of separate pH-phase rows.
     if values["Pre-pH Blending"] is None:
-        overall_blending = _matching_rows(batch_table, ["Blending"])
-        if not overall_blending.empty and "Validation" in overall_blending.columns:
-            overall_blending = overall_blending[
-                overall_blending["Validation"].astype(str).eq("OK")
-            ]
-        values["Pre-pH Blending"] = _sum_duration(overall_blending)
+        values["Pre-pH Blending"] = _sum_duration(
+            _matching_rows(batch_table, ["Blending"])
+        )
 
     return values
 
@@ -442,22 +439,14 @@ def main() -> None:
         try:
             report = parse_pdf(uploaded_file, uploaded_file.name)
             parsed_reports.append(report)
-            error_message = report.get("Error", "")
-            warnings = report.get("Warnings", [])
-            warning_message = "; ".join(str(item) for item in warnings)
-            message = error_message or warning_message
-            status = (
-                "Unsupported" if error_message
-                else "Validation warning" if warnings
-                else "Success"
-            )
+            message = report.get("Error", "")
             log_rows.append(
                 {
                     "File": uploaded_file.name,
                     "Report type": report["Report Type"],
                     "Batch": report["Batch"],
                     "Rows": len(report["Rows"]),
-                    "Status": status,
+                    "Status": "Unsupported" if message else "Success",
                     "Message": message,
                 }
             )
@@ -480,15 +469,6 @@ def main() -> None:
     progress.empty()
 
     extraction_log = pd.DataFrame(log_rows)
-    validation_warnings = extraction_log[
-        extraction_log["Status"].eq("Validation warning")
-    ]
-    if not validation_warnings.empty:
-        st.warning(
-            "Blending validation warning: one or more reports are missing "
-            "cycle 60 or its completion marker. Affected phase durations are "
-            "left blank and are excluded from totals. Review Extraction Log."
-        )
     actual = combine_reports(parsed_reports)
 
     if actual.empty:
