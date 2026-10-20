@@ -1,4 +1,22 @@
-"""PDF extraction logic for the EB Execution Date app."""
+"""PDF parsers for the EB Execution Date Streamlit application.
+
+Blending phase rules
+--------------------
+Pre-pH Blending:
+    Batch Process Overview blending start -> completion of cycle 60.
+    Completion is the cycle-60 ``Close 2mm Orifice`` timestamp. If that event
+    is absent, the final cycle-60 blending row before the first pH sample is
+    used.
+pH sample 1:
+    cycle-60 completion -> final ``Sample: IPS PH`` row before ``Adjust PH``.
+pH adjustment:
+    first ``Adjust PH`` row -> final ``Adjust PH`` row before post-pH blending.
+Post-pH blending:
+    first blending row after pH adjustment -> completion of the post-pH cycle
+    (prefer ``Close 2mm Orifice`` with cycle greater than 60).
+pH sample 2:
+    post-pH cycle completion -> final pH-sample row / blending process end.
+"""
 from __future__ import annotations
 
 import io
@@ -25,7 +43,7 @@ COLUMNS = [
 ]
 
 
-def _bytes(source: Any) -> bytes:
+def _read_bytes(source: Any) -> bytes:
     if isinstance(source, bytes):
         return source
     if isinstance(source, (str, Path)):
@@ -38,14 +56,21 @@ def _bytes(source: Any) -> bytes:
         if position is not None and hasattr(source, "seek"):
             source.seek(position)
         return data
-    raise TypeError("Unsupported PDF input.")
+    raise TypeError("Unsupported PDF input type.")
 
 
-def _text(source: Any, pages: int = 8) -> str:
-    reader = PdfReader(io.BytesIO(_bytes(source)))
+def _reader(source: Any) -> PdfReader:
+    return PdfReader(io.BytesIO(_read_bytes(source)))
+
+
+def _page_text(reader: PdfReader, index: int) -> str:
+    return reader.pages[index].extract_text() or ""
+
+
+def _first_pages_text(reader: PdfReader, count: int) -> str:
     return "\n".join(
-        (reader.pages[index].extract_text() or "")
-        for index in range(min(pages, len(reader.pages)))
+        _page_text(reader, index)
+        for index in range(min(count, len(reader.pages)))
     )
 
 
@@ -53,44 +78,53 @@ def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _batch_number(text: str, file_name: str) -> str:
+def _date(value: str) -> datetime:
+    return datetime.strptime(value.strip(), DT_FORMAT)
+
+
+def _batch_number(text: str, file_name: str = "") -> str:
     labelled = re.search(
         rf"Batch\s*(?:no\.?|number)?\s*[:.]?\s*({BATCH_PATTERN})",
         text,
         re.IGNORECASE,
     )
-    fallback = re.search(BATCH_PATTERN, file_name, re.IGNORECASE)
-    generic = re.search(BATCH_PATTERN, text, re.IGNORECASE)
-    match = labelled or fallback or generic
-    return match.group(1 if labelled else 0).upper() if match else "UNKNOWN"
+    if labelled:
+        return labelled.group(1).upper()
+    for source in (file_name, text):
+        match = re.search(BATCH_PATTERN, source, re.IGNORECASE)
+        if match:
+            return match.group(0).upper()
+    return "UNKNOWN"
 
 
 def _row(
     stage: str,
     machine: str,
-    start: str,
-    end: str,
+    start: datetime | str,
+    end: datetime | str,
     source: str,
     index: int | None = None,
     total: int | None = None,
 ) -> dict[str, Any]:
-    start_dt = datetime.strptime(start, DT_FORMAT)
-    end_dt = datetime.strptime(end, DT_FORMAT)
+    start_dt = _date(start) if isinstance(start, str) else start
+    end_dt = _date(end) if isinstance(end, str) else end
+    duration = (end_dt - start_dt).total_seconds() / 3600
     return {
         "Stage": stage,
         "Machine": machine,
         "Process Start": start_dt,
         "Process End": end_dt,
-        "Duration (hours)": round((end_dt - start_dt).total_seconds() / 3600, 4),
+        "Duration (hours)": round(duration, 4),
         "Index": index,
         "Total": total,
         "Source": source,
-        "Validation": "OK" if end_dt >= start_dt else "End before start",
+        "Validation": "OK" if duration >= 0 else "End before start",
     }
 
 
 def detect_report_type(source: Any) -> str:
-    probe = _text(source, 8).upper()
+    reader = _reader(source)
+    probe = _first_pages_text(reader, 8).upper()
     if "SYSTEM INTEGRITY REPORT" in probe:
         return SYSTEM
     if "BATCH START TIME" in probe and (
@@ -98,14 +132,15 @@ def detect_report_type(source: Any) -> str:
     ):
         return PFS
     if "PROCESS OVERVIEW" in probe and any(
-        value in probe for value in ("WETTING", "PREMIXING", "MIXING EXTRUDER")
+        marker in probe for marker in ("WETTING", "PREMIXING", "MIXING EXTRUDER")
     ):
         return BATCH
     return UNKNOWN
 
 
-def parse_system_integrity(source: Any, file_name: str) -> dict[str, Any]:
-    text = _text(source, 2)
+def parse_system_integrity(source: Any, file_name: str = "") -> dict[str, Any]:
+    reader = _reader(source)
+    text = _first_pages_text(reader, 2)
     normal = _clean(text)
     pattern = re.compile(
         rf"(Dryrun|Leak\s*Test|Vacuum\s*Test)\s+"
@@ -120,16 +155,13 @@ def parse_system_integrity(source: Any, file_name: str) -> dict[str, Any]:
     }
     rows = []
     for match in pattern.finditer(normal):
-        process = _clean(match.group(1)).lower()
+        process = _clean(match.group(1)).casefold()
         rows.append(
             _row(
-                labels[process],
-                _clean(match.group(2)).title(),
-                match.group(3),
-                match.group(4),
+                labels[process], _clean(match.group(2)).title(),
+                match.group(3), match.group(4),
                 "System Integrity Process Overview",
-                int(match.group(5)),
-                int(match.group(6)),
+                int(match.group(5)), int(match.group(6)),
             )
         )
     return {
@@ -139,8 +171,7 @@ def parse_system_integrity(source: Any, file_name: str) -> dict[str, Any]:
     }
 
 
-def parse_batch_cycle(source: Any, file_name: str) -> dict[str, Any]:
-    text = _text(source, 4)
+def _overview_rows(text: str) -> list[dict[str, Any]]:
     normal = _clean(text)
     pattern = re.compile(
         rf"(API\s*Charge|Water\s*Charge|Wetting|Premixing|Mixing|Blending)\s+"
@@ -149,53 +180,272 @@ def parse_batch_cycle(source: Any, file_name: str) -> dict[str, Any]:
         re.IGNORECASE,
     )
     labels = {
-        "api charge": "API charging", "water charge": "Water charging",
-        "wetting": "Wetting", "premixing": "Pre-mixing",
-        "mixing": "Mixing", "blending": "Blending",
+        "api charge": "API charging",
+        "water charge": "Water charging",
+        "wetting": "Wetting",
+        "premixing": "Pre-mixing",
+        "mixing": "Mixing",
+        "blending": "Blending",
     }
-    raw_rows = []
+    rows = []
     for match in pattern.finditer(normal):
-        process = _clean(match.group(1)).lower()
-        raw_rows.append(
+        process = _clean(match.group(1)).casefold()
+        rows.append(
             _row(
                 labels[process], _clean(match.group(2)).title(),
                 match.group(3), match.group(4), "Batch Process Overview",
                 int(match.group(5)), int(match.group(6)),
             )
         )
+    return rows
 
-    rows = []
+
+def _extract_blending_events(reader: PdfReader) -> pd.DataFrame:
+    """Extract only boundary-relevant rows from BLENDING DATALOG pages."""
+    events: list[dict[str, Any]] = []
+    date_re = re.compile(DT_PATTERN)
+    cycle_re = re.compile(r"\b(\d{1,3})\b")
+    known_steps = (
+        "close 2mm orifice",
+        "sample: ips ph",
+        "sample ips ph",
+        "adjust ph",
+        "blending to accumulator left",
+        "blending to accumulator right",
+    )
+
+    for page_index in range(len(reader.pages)):
+        text = _page_text(reader, page_index)
+        if "BLENDING DATALOG" not in text.upper():
+            continue
+
+        # pypdf normally preserves each datalog record on a line. A fallback
+        # split at each date handles pages whose rows are concatenated.
+        lines = text.splitlines()
+        if not any(date_re.search(line) for line in lines):
+            lines = re.split(rf"(?={DT_PATTERN})", _clean(text))
+
+        for line in lines:
+            date_match = date_re.search(line)
+            if not date_match:
+                continue
+            lower = _clean(line).casefold()
+            step = next((item for item in known_steps if item in lower), None)
+            if step is None:
+                continue
+
+            after_step = lower.split(step, 1)[1]
+            cycle_match = cycle_re.search(after_step)
+            cycle = int(cycle_match.group(1)) if cycle_match else None
+            events.append(
+                {
+                    "Time": _date(date_match.group(0)),
+                    "Step": step,
+                    "Cycle": cycle,
+                    "Page": page_index + 1,
+                }
+            )
+
+    if not events:
+        return pd.DataFrame(columns=["Time", "Step", "Cycle", "Page"])
+
+    return (
+        pd.DataFrame(events)
+        .drop_duplicates(subset=["Time", "Step", "Cycle"])
+        .sort_values(["Time", "Page"])
+        .reset_index(drop=True)
+    )
+
+
+def _last_time(events: pd.DataFrame, mask: pd.Series) -> datetime | None:
+    selected = events.loc[mask, "Time"]
+    return selected.max() if not selected.empty else None
+
+
+def _first_time(events: pd.DataFrame, mask: pd.Series) -> datetime | None:
+    selected = events.loc[mask, "Time"]
+    return selected.min() if not selected.empty else None
+
+
+def _blending_phase_rows(
+    events: pd.DataFrame,
+    blending_start: datetime,
+    blending_end: datetime,
+) -> list[dict[str, Any]]:
+    """Convert ordered datalog boundaries into the five blending phases."""
+    if events.empty:
+        return []
+
+    events = events[
+        (events["Time"] >= blending_start) & (events["Time"] <= blending_end)
+    ].copy()
+    if events.empty:
+        return []
+
+    step = events["Step"]
+    cycle = pd.to_numeric(events["Cycle"], errors="coerce")
+
+    # 1) Pre-pH blending ends when cycle 60 is completed. The screenshot shows
+    # Close 2mm Orifice at 23/09/2026 15:40:54, cycle 60.
+    pre_end = _last_time(
+        events,
+        step.eq("close 2mm orifice") & cycle.eq(60),
+    )
+    first_sample = _first_time(
+        events,
+        step.isin(["sample: ips ph", "sample ips ph"]),
+    )
+    if pre_end is None and first_sample is not None:
+        pre_end = _last_time(
+            events,
+            (events["Time"] < first_sample)
+            & cycle.eq(60)
+            & step.str.startswith("blending to accumulator"),
+        )
+    if pre_end is None:
+        return []
+
+    # 2) pH sample 1 runs from pre-pH completion through the final sampling
+    # row immediately before the first Adjust PH row.
+    first_adjust = _first_time(
+        events,
+        (events["Time"] > pre_end) & step.eq("adjust ph"),
+    )
+    if first_adjust is None:
+        return []
+    sample1_end = _last_time(
+        events,
+        (events["Time"] >= pre_end)
+        & (events["Time"] < first_adjust)
+        & step.isin(["sample: ips ph", "sample ips ph"]),
+    )
+    sample1_end = sample1_end or pre_end
+
+    # 3) pH adjustment ends at the final Adjust PH row before post-pH blending.
+    first_post_blend = _first_time(
+        events,
+        (events["Time"] > first_adjust)
+        & step.str.startswith("blending to accumulator"),
+    )
+    if first_post_blend is None:
+        return []
+    adjustment_end = _last_time(
+        events,
+        (events["Time"] >= first_adjust)
+        & (events["Time"] < first_post_blend)
+        & step.eq("adjust ph"),
+    )
+    adjustment_end = adjustment_end or first_adjust
+
+    # 4) Post-pH blending ends at the closing event for the post-pH cycle.
+    # Prefer a Close 2mm Orifice event with cycle > 60 and before sample 2.
+    post_close_candidates = events[
+        (events["Time"] >= first_post_blend)
+        & step.eq("close 2mm orifice")
+        & cycle.gt(60)
+    ]
+    if post_close_candidates.empty:
+        post_close_candidates = events[
+            (events["Time"] >= first_post_blend)
+            & step.eq("close 2mm orifice")
+        ]
+    post_end = (
+        post_close_candidates["Time"].max()
+        if not post_close_candidates.empty
+        else None
+    )
+    if post_end is None:
+        return []
+
+    # 5) pH sample 2 begins at post-pH completion and ends at the final sample
+    # row. If the report's Process Overview end is later, retain that official
+    # process end so the phase reconciles to the complete Blending interval.
+    sample2_last = _last_time(
+        events,
+        (events["Time"] >= post_end)
+        & step.isin(["sample: ips ph", "sample ips ph"]),
+    )
+    sample2_end = blending_end if blending_end >= (sample2_last or post_end) else sample2_last
+    sample2_end = sample2_end or blending_end
+
+    boundaries = [
+        ("Pre-pH Blending", blending_start, pre_end, "Cycle 60 completion"),
+        ("pH sample", pre_end, sample1_end, "Last sample before Adjust PH"),
+        ("pH adjustment", first_adjust, adjustment_end, "Adjust PH interval"),
+        ("Post-pH blending", first_post_blend, post_end, "Post-pH cycle completion"),
+        ("pH sample", post_end, sample2_end, "Final pH sample interval"),
+    ]
+
+    return [
+        _row(stage, "Blending", start, end, f"Blending Datalog - {rule}")
+        for stage, start, end, rule in boundaries
+        if start is not None and end is not None and end >= start
+    ]
+
+
+def parse_batch_cycle(source: Any, file_name: str = "") -> dict[str, Any]:
+    reader = _reader(source)
+    overview_text = _first_pages_text(reader, 4)
+    raw_rows = _overview_rows(overview_text)
+    rows: list[dict[str, Any]] = []
+
+    # Charging stages use the overall elapsed interval across repeated charges.
     for stage in ("Water charging", "API charging"):
         matching = [item for item in raw_rows if item["Stage"] == stage]
         if matching:
             start = min(item["Process Start"] for item in matching)
             end = max(item["Process End"] for item in matching)
-            rows.append({
-                "Stage": stage, "Machine": stage,
-                "Process Start": start, "Process End": end,
-                "Duration (hours)": round((end - start).total_seconds() / 3600, 4),
-                "Index": None, "Total": len(matching),
-                "Source": "Minimum start to maximum end of Process Overview",
-                "Validation": "OK",
-            })
+            rows.append(
+                _row(
+                    stage, stage, start, end,
+                    "Minimum start to maximum end of Process Overview",
+                    total=len(matching),
+                )
+            )
+
     rows.extend(
-        item for item in raw_rows
-        if item["Stage"] not in {"Water charging", "API charging"}
+        item
+        for item in raw_rows
+        if item["Stage"] not in {"Water charging", "API charging", "Blending"}
     )
+
+    blending_overview = [item for item in raw_rows if item["Stage"] == "Blending"]
+    if blending_overview:
+        blending_start = min(item["Process Start"] for item in blending_overview)
+        blending_end = max(item["Process End"] for item in blending_overview)
+        events = _extract_blending_events(reader)
+        phase_rows = _blending_phase_rows(events, blending_start, blending_end)
+        if phase_rows:
+            rows.extend(phase_rows)
+        else:
+            # Preserve the overall record and make the limitation visible.
+            rows.append(
+                _row(
+                    "Blending", "Blending", blending_start, blending_end,
+                    "Batch Process Overview - phase boundaries not detected",
+                )
+            )
+
     return {
-        "Batch": _batch_number(text, file_name),
+        "Batch": _batch_number(overview_text, file_name),
         "Report Type": BATCH,
         "Rows": pd.DataFrame(rows, columns=COLUMNS),
     }
 
 
-def parse_pfs(source: Any, file_name: str) -> dict[str, Any]:
-    text = _text(source, 8)
+def parse_pfs(source: Any, file_name: str = "") -> dict[str, Any]:
+    reader = _reader(source)
+    text = _first_pages_text(reader, 8)
     start = re.search(rf"Batch Start Time\s*:\s*({DT_PATTERN})", text, re.I)
     end = re.search(rf"Batch End Time\s*:\s*({DT_PATTERN})", text, re.I)
     rows = []
     if start and end:
-        rows.append(_row("Filling", "PFS Filling Line", start.group(1), end.group(1), "PFS batch header"))
+        rows.append(
+            _row(
+                "Filling", "PFS Filling Line", start.group(1), end.group(1),
+                "PFS batch header",
+            )
+        )
     return {
         "Batch": _batch_number(text, file_name),
         "Report Type": PFS,
@@ -227,24 +477,42 @@ def combine_reports(reports: list[dict[str, Any]]) -> pd.DataFrame:
         if not tables:
             continue
         table = pd.concat(tables, ignore_index=True)
-        cycles = [r for r in group if r["Report Type"] == BATCH and not r["Rows"].empty]
-        filling = [r for r in group if r["Report Type"] == PFS and not r["Rows"].empty]
-        if cycles and filling:
-            start = cycles[0]["Rows"]["Process End"].max()
-            end = filling[0]["Rows"]["Process Start"].min()
-            if pd.notna(start) and pd.notna(end) and end >= start:
-                setup = {
-                    "Stage": "Filling setup", "Machine": "Inter-report gap",
-                    "Process Start": start, "Process End": end,
-                    "Duration (hours)": round((end - start).total_seconds() / 3600, 4),
-                    "Index": None, "Total": None,
-                    "Source": "Batch-cycle end to PFS filling start", "Validation": "OK",
-                }
-                table = pd.concat([table, pd.DataFrame([setup])], ignore_index=True)
+
+        cycle_reports = [
+            report for report in group
+            if report["Report Type"] == BATCH and not report["Rows"].empty
+        ]
+        filling_reports = [
+            report for report in group
+            if report["Report Type"] == PFS and not report["Rows"].empty
+        ]
+        if cycle_reports and filling_reports:
+            cycle_end = cycle_reports[0]["Rows"]["Process End"].max()
+            filling_start = filling_reports[0]["Rows"]["Process Start"].min()
+            if pd.notna(cycle_end) and pd.notna(filling_start) and filling_start >= cycle_end:
+                table = pd.concat(
+                    [
+                        table,
+                        pd.DataFrame(
+                            [
+                                _row(
+                                    "Filling setup", "Inter-report gap",
+                                    cycle_end, filling_start,
+                                    "Batch-cycle end to PFS filling start",
+                                )
+                            ]
+                        ),
+                    ],
+                    ignore_index=True,
+                )
+
         table.insert(0, "Batch", batch)
         combined.append(table)
+
     if not combined:
         return pd.DataFrame(columns=["Batch", *COLUMNS])
-    return pd.concat(combined, ignore_index=True).sort_values(
-        ["Batch", "Process Start", "Stage", "Machine"]
-    ).reset_index(drop=True)
+    return (
+        pd.concat(combined, ignore_index=True)
+        .sort_values(["Batch", "Process Start", "Stage", "Machine"])
+        .reset_index(drop=True)
+    )
