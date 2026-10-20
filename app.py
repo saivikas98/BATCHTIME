@@ -151,7 +151,27 @@ def calculate_batch_values(
     for display_name, source_names in integrity_mapping.items():
         group = _matching_rows(batch_table, source_names)
         values[f"SI elapsed - {display_name}"] = _elapsed_hours(group)
-        values[f"SI actual - {display_name}"] = _maximum_duration(group)
+
+        # Combine repeated executions machine-wise. If the same step is
+        # executed more than once on one extruder, its actual machine cycle
+        # starts at that extruder's first execution start and ends at that
+        # extruder's final execution end. The stage actual cycle is the
+        # maximum combined machine cycle across all extruders.
+        #
+        # Example: Leak Test, Extruder 2
+        # first start  28/07/2026 00:21:54
+        # final end    28/07/2026 05:49:21
+        # combined actual cycle = 5.4575 h, including the inter-cycle gap.
+        machine_cycles: list[float] = []
+        if not group.empty:
+            for _, machine_group in group.groupby("Machine", dropna=False):
+                combined_machine_hours = _elapsed_hours(machine_group)
+                if combined_machine_hours is not None:
+                    machine_cycles.append(combined_machine_hours)
+
+        values[f"SI actual - {display_name}"] = (
+            round(max(machine_cycles), 2) if machine_cycles else None
+        )
 
     # These extruder operations run in parallel. The batch duration is the
     # maximum duration among Extruders 1, 2, and 3.
