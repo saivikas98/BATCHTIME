@@ -258,7 +258,17 @@ def _extract_blending_events(reader: PdfReader) -> pd.DataFrame:
 
     for page_index in _find_blending_page_range(reader):
         text = _page_text(reader, page_index)
-        if "BLENDING DATALOG" not in text.upper():
+        upper_text = text.upper()
+
+        # Do not require the literal page heading. Some PDF extraction engines
+        # omit the repeated "BLENDING DATALOG" header on continuation pages.
+        # A page is accepted when it contains a blending boundary step and a
+        # report timestamp. This also handles EG26070 reliably.
+        has_timestamp = bool(date_re.search(text))
+        has_boundary_step = any(
+            candidate.upper() in upper_text for candidate in known_steps
+        )
+        if not has_timestamp or not has_boundary_step:
             continue
 
         matches = list(date_re.finditer(text))
@@ -349,10 +359,25 @@ def _validate_blending_sequence(
         "sample2_end": None,
     }
     if window.empty:
-        result.update(
-            code="BLEND_NO_DATALOG",
-            message="No Blending Datalog boundary rows were extracted.",
-        )
+        if events.empty:
+            result.update(
+                code="BLEND_NO_DATALOG",
+                message=(
+                    "No Blending Datalog boundary rows were extracted from the PDF. "
+                    "The parser did not detect timestamped blending, sampling, or Adjust PH records."
+                ),
+            )
+        else:
+            result.update(
+                code="BLEND_DATALOG_OUTSIDE_OVERVIEW",
+                message=(
+                    "Blending Datalog rows were extracted, but none fell within the "
+                    f"Process Overview interval {blending_start:%d/%m/%Y %H:%M:%S} to "
+                    f"{blending_end:%d/%m/%Y %H:%M:%S}. Extracted event range: "
+                    f"{events['Time'].min():%d/%m/%Y %H:%M:%S} to "
+                    f"{events['Time'].max():%d/%m/%Y %H:%M:%S}."
+                ),
+            )
         return result
 
     sample_steps = {"sample: ips ph", "sample ips ph"}
