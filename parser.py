@@ -267,121 +267,269 @@ def _first_time(events: pd.DataFrame, mask: pd.Series) -> datetime | None:
     return selected.min() if not selected.empty else None
 
 
+
+def _validate_blending_sequence(
+    events: pd.DataFrame,
+    blending_start: datetime,
+    blending_end: datetime,
+) -> dict[str, Any]:
+    """Validate the pre-pH, adjustment, and post-pH blending sequence.
+
+    The decision is transition-based, not based only on the presence of cycle
+    numbers somewhere in the report:
+
+    * Pre-pH blending is accepted only when blending stops at cycle 60 and the
+      next phase is pH sampling.
+    * pH sample 1 ends at the final sample row immediately before Adjust PH.
+    * pH adjustment ends at the final Adjust PH row before blending resumes.
+    * Post-pH blending is accepted only when resumed blending stops at cycle
+      100 and the next phase is pH sampling.
+    * pH sample 2 begins at cycle-100 completion.
+    """
+    window = events[
+        (events["Time"] >= blending_start) & (events["Time"] <= blending_end)
+    ].copy().sort_values(["Time", "Page"]).reset_index(drop=True)
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "code": "BLEND_SEQUENCE_INVALID",
+        "message": "Blending phase sequence could not be validated.",
+        "pre_end": None,
+        "sample1_end": None,
+        "adjust_start": None,
+        "adjust_end": None,
+        "post_start": None,
+        "post_end": None,
+        "sample2_end": None,
+    }
+    if window.empty:
+        result.update(
+            code="BLEND_NO_DATALOG",
+            message="No Blending Datalog boundary rows were extracted.",
+        )
+        return result
+
+    sample_steps = {"sample: ips ph", "sample ips ph"}
+    is_sample = window["Step"].isin(sample_steps)
+    is_adjust = window["Step"].eq("adjust ph")
+    is_blending = window["Step"].str.startswith("blending to accumulator")
+    is_close = window["Step"].eq("close 2mm orifice")
+    is_blend_boundary = is_blending | is_close
+    cycle = pd.to_numeric(window["Cycle"], errors="coerce")
+
+    # PRE-PH: identify the first sampling block. The immediately preceding
+    # blending boundary must terminate at cycle 60. If blending continues to
+    # cycle 61 or higher before sampling, cycle 60 is not a phase endpoint.
+    first_sample_index = window.index[is_sample].min() if is_sample.any() else None
+    if first_sample_index is None or pd.isna(first_sample_index):
+        result.update(
+            code="BLEND_SAMPLE1_MISSING",
+            message="No first pH-sampling block was found after pre-pH blending.",
+        )
+        return result
+
+    before_sample1 = window.loc[window.index < int(first_sample_index)].copy()
+    boundary_before_sample1 = before_sample1[
+        before_sample1["Step"].str.startswith("blending to accumulator")
+        | before_sample1["Step"].eq("close 2mm orifice")
+    ]
+    if boundary_before_sample1.empty:
+        result.update(
+            code="BLEND_PRE_BOUNDARY_MISSING",
+            message="No blending completion row was found before pH sample 1.",
+        )
+        return result
+
+    final_pre_boundary = boundary_before_sample1.iloc[-1]
+    final_pre_cycle = pd.to_numeric(
+        pd.Series([final_pre_boundary["Cycle"]]), errors="coerce"
+    ).iloc[0]
+    if pd.isna(final_pre_cycle) or int(final_pre_cycle) != 60:
+        max_pre_cycle = pd.to_numeric(
+            boundary_before_sample1["Cycle"], errors="coerce"
+        ).max()
+        result.update(
+            code="BLEND_DID_NOT_STOP_AT_60",
+            message=(
+                "Blending did not stop at cycle 60 before pH sample 1. "
+                f"The final cycle before sampling was {max_pre_cycle}."
+            ),
+        )
+        return result
+
+    pre_end = final_pre_boundary["Time"]
+    pre_completion_rule = (
+        "Close 2mm Orifice at cycle 60"
+        if final_pre_boundary["Step"] == "close 2mm orifice"
+        else "final blending row at cycle 60"
+    )
+
+    # SAMPLE 1: final sample timestamp before the first Adjust PH timestamp.
+    adjust_indices = window.index[(window.index > int(first_sample_index)) & is_adjust]
+    if len(adjust_indices) == 0:
+        result.update(
+            code="BLEND_ADJUST_PH_MISSING",
+            message="Adjust PH was not found after pH sample 1.",
+        )
+        return result
+    first_adjust_index = int(adjust_indices.min())
+    first_adjust_time = window.loc[first_adjust_index, "Time"]
+    sample1_rows = window[
+        (window.index >= int(first_sample_index))
+        & (window.index < first_adjust_index)
+        & is_sample
+    ]
+    if sample1_rows.empty:
+        result.update(
+            code="BLEND_SAMPLE1_END_MISSING",
+            message="No pH sample 1 row was found before Adjust PH.",
+        )
+        return result
+    sample1_end = sample1_rows["Time"].max()
+
+    # ADJUSTMENT: adjustment ends immediately before blending resumes.
+    resumed_blend_indices = window.index[
+        (window.index > first_adjust_index) & is_blending
+    ]
+    if len(resumed_blend_indices) == 0:
+        result.update(
+            code="BLEND_POST_START_MISSING",
+            message="Blending did not resume after Adjust PH.",
+        )
+        return result
+    post_start_index = int(resumed_blend_indices.min())
+    post_start = window.loc[post_start_index, "Time"]
+    adjustment_rows = window[
+        (window.index >= first_adjust_index)
+        & (window.index < post_start_index)
+        & is_adjust
+    ]
+    adjust_end = (
+        adjustment_rows["Time"].max()
+        if not adjustment_rows.empty
+        else first_adjust_time
+    )
+
+    # POST-PH: identify the first sampling row after blending resumes. The
+    # immediately preceding blending boundary must terminate at cycle 100.
+    sample2_indices = window.index[(window.index > post_start_index) & is_sample]
+    if len(sample2_indices) == 0:
+        result.update(
+            code="BLEND_SAMPLE2_MISSING",
+            message="No pH sample 2 block was found after post-pH blending.",
+        )
+        return result
+    first_sample2_index = int(sample2_indices.min())
+    post_boundaries = window[
+        (window.index >= post_start_index)
+        & (window.index < first_sample2_index)
+        & is_blend_boundary
+    ]
+    if post_boundaries.empty:
+        result.update(
+            code="BLEND_POST_BOUNDARY_MISSING",
+            message="No post-pH blending completion row was found before pH sample 2.",
+        )
+        return result
+
+    final_post_boundary = post_boundaries.iloc[-1]
+    final_post_cycle = pd.to_numeric(
+        pd.Series([final_post_boundary["Cycle"]]), errors="coerce"
+    ).iloc[0]
+    if pd.isna(final_post_cycle) or int(final_post_cycle) != 100:
+        max_post_cycle = pd.to_numeric(
+            post_boundaries["Cycle"], errors="coerce"
+        ).max()
+        result.update(
+            code="BLEND_DID_NOT_STOP_AT_100",
+            message=(
+                "Post-pH blending did not stop at cycle 100 before pH sample 2. "
+                f"The final cycle before sampling was {max_post_cycle}."
+            ),
+        )
+        return result
+
+    post_end = final_post_boundary["Time"]
+    post_completion_rule = (
+        "Close 2mm Orifice at cycle 100"
+        if final_post_boundary["Step"] == "close 2mm orifice"
+        else "final blending row at cycle 100"
+    )
+
+    sample2_rows = window[
+        (window.index >= first_sample2_index) & is_sample
+    ]
+    sample2_last = sample2_rows["Time"].max() if not sample2_rows.empty else post_end
+    sample2_end = max(sample2_last, blending_end)
+
+    result.update(
+        ok=True,
+        code="OK",
+        message=(
+            f"Validated pre-pH completion from {pre_completion_rule}; "
+            f"validated post-pH completion from {post_completion_rule}."
+        ),
+        pre_end=pre_end,
+        sample1_end=sample1_end,
+        adjust_start=first_adjust_time,
+        adjust_end=adjust_end,
+        post_start=post_start,
+        post_end=post_end,
+        sample2_end=sample2_end,
+    )
+    return result
+
+
 def _blending_phase_rows(
     events: pd.DataFrame,
     blending_start: datetime,
     blending_end: datetime,
-) -> list[dict[str, Any]]:
-    """Convert ordered datalog boundaries into the five blending phases."""
-    if events.empty:
-        return []
-
-    events = events[
-        (events["Time"] >= blending_start) & (events["Time"] <= blending_end)
-    ].copy()
-    if events.empty:
-        return []
-
-    step = events["Step"]
-    cycle = pd.to_numeric(events["Cycle"], errors="coerce")
-
-    # 1) Pre-pH blending ends when cycle 60 is completed. The screenshot shows
-    # Close 2mm Orifice at 23/09/2026 15:40:54, cycle 60.
-    pre_end = _last_time(
-        events,
-        step.eq("close 2mm orifice") & cycle.eq(60),
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build blending phases only after the full 60/sample/adjust/100 sequence validates."""
+    validation = _validate_blending_sequence(
+        events, blending_start, blending_end
     )
-    first_sample = _first_time(
-        events,
-        step.isin(["sample: ips ph", "sample ips ph"]),
-    )
-    if pre_end is None and first_sample is not None:
-        pre_end = _last_time(
-            events,
-            (events["Time"] < first_sample)
-            & cycle.eq(60)
-            & step.str.startswith("blending to accumulator"),
-        )
-    if pre_end is None:
-        return []
-
-    # 2) pH sample 1 runs from pre-pH completion through the final sampling
-    # row immediately before the first Adjust PH row.
-    first_adjust = _first_time(
-        events,
-        (events["Time"] > pre_end) & step.eq("adjust ph"),
-    )
-    if first_adjust is None:
-        return []
-    sample1_end = _last_time(
-        events,
-        (events["Time"] >= pre_end)
-        & (events["Time"] < first_adjust)
-        & step.isin(["sample: ips ph", "sample ips ph"]),
-    )
-    sample1_end = sample1_end or pre_end
-
-    # 3) pH adjustment ends at the final Adjust PH row before post-pH blending.
-    first_post_blend = _first_time(
-        events,
-        (events["Time"] > first_adjust)
-        & step.str.startswith("blending to accumulator"),
-    )
-    if first_post_blend is None:
-        return []
-    adjustment_end = _last_time(
-        events,
-        (events["Time"] >= first_adjust)
-        & (events["Time"] < first_post_blend)
-        & step.eq("adjust ph"),
-    )
-    adjustment_end = adjustment_end or first_adjust
-
-    # 4) Post-pH blending ends at the closing event for the post-pH cycle.
-    # Prefer a Close 2mm Orifice event with cycle > 60 and before sample 2.
-    post_close_candidates = events[
-        (events["Time"] >= first_post_blend)
-        & step.eq("close 2mm orifice")
-        & cycle.gt(60)
-    ]
-    if post_close_candidates.empty:
-        post_close_candidates = events[
-            (events["Time"] >= first_post_blend)
-            & step.eq("close 2mm orifice")
-        ]
-    post_end = (
-        post_close_candidates["Time"].max()
-        if not post_close_candidates.empty
-        else None
-    )
-    if post_end is None:
-        return []
-
-    # 5) pH sample 2 begins at post-pH completion and ends at the final sample
-    # row. If the report's Process Overview end is later, retain that official
-    # process end so the phase reconciles to the complete Blending interval.
-    sample2_last = _last_time(
-        events,
-        (events["Time"] >= post_end)
-        & step.isin(["sample: ips ph", "sample ips ph"]),
-    )
-    sample2_end = blending_end if blending_end >= (sample2_last or post_end) else sample2_last
-    sample2_end = sample2_end or blending_end
+    if not validation["ok"]:
+        return [], validation
 
     boundaries = [
-        ("Pre-pH Blending", blending_start, pre_end, "Cycle 60 completion"),
-        ("pH sample", pre_end, sample1_end, "Last sample before Adjust PH"),
-        ("pH adjustment", first_adjust, adjustment_end, "Adjust PH interval"),
-        ("Post-pH blending", first_post_blend, post_end, "Post-pH cycle completion"),
-        ("pH sample", post_end, sample2_end, "Final pH sample interval"),
+        (
+            "Pre-pH Blending",
+            blending_start,
+            validation["pre_end"],
+            "blending stopped at cycle 60 before sampling",
+        ),
+        (
+            "pH sample",
+            validation["pre_end"],
+            validation["sample1_end"],
+            "sample 1 ended immediately before Adjust PH",
+        ),
+        (
+            "pH adjustment",
+            validation["adjust_start"],
+            validation["adjust_end"],
+            "Adjust PH interval before blending resumed",
+        ),
+        (
+            "Post-pH blending",
+            validation["post_start"],
+            validation["post_end"],
+            "resumed blending stopped at cycle 100 before sampling",
+        ),
+        (
+            "pH sample",
+            validation["post_end"],
+            validation["sample2_end"],
+            "sample 2 interval after cycle 100",
+        ),
     ]
-
-    return [
-        _row(stage, "Blending", start, end, f"Blending Datalog - {rule}")
-        for stage, start, end, rule in boundaries
-        if start is not None and end is not None and end >= start
+    rows = [
+        _row(stage, "Blending", phase_start, phase_end, f"Blending Datalog - {rule}")
+        for stage, phase_start, phase_end, rule in boundaries
+        if phase_start is not None and phase_end is not None and phase_end >= phase_start
     ]
-
+    return rows, validation
 
 def parse_batch_cycle(source: Any, file_name: str = "") -> dict[str, Any]:
     reader = _reader(source)
@@ -414,22 +562,31 @@ def parse_batch_cycle(source: Any, file_name: str = "") -> dict[str, Any]:
         blending_start = min(item["Process Start"] for item in blending_overview)
         blending_end = max(item["Process End"] for item in blending_overview)
         events = _extract_blending_events(reader)
-        phase_rows = _blending_phase_rows(events, blending_start, blending_end)
+        phase_rows, blending_validation = _blending_phase_rows(
+            events, blending_start, blending_end
+        )
         if phase_rows:
             rows.extend(phase_rows)
         else:
-            # Preserve the overall record and make the limitation visible.
-            rows.append(
-                _row(
-                    "Blending", "Blending", blending_start, blending_end,
-                    "Batch Process Overview - phase boundaries not detected",
-                )
+            # Retain the overall interval only as a diagnostic record. Invalid
+            # phase boundaries are excluded from the process-time summary.
+            diagnostic = _row(
+                "Blending", "Blending", blending_start, blending_end,
+                f"Validation failure - {blending_validation['message']}",
             )
+            diagnostic["Validation"] = blending_validation["code"]
+            rows.append(diagnostic)
 
+    warnings = [
+        str(value)
+        for value in pd.DataFrame(rows).get("Validation", pd.Series(dtype=str)).tolist()
+        if value not in ("OK", None, "")
+    ]
     return {
         "Batch": _batch_number(overview_text, file_name),
         "Report Type": BATCH,
         "Rows": pd.DataFrame(rows, columns=COLUMNS),
+        "Warnings": sorted(set(warnings)),
     }
 
 
