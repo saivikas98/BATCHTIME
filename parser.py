@@ -34,6 +34,7 @@ SYSTEM = "System Integrity Report"
 BATCH = "Batch Cycle Report"
 PFS = "PFS Filling Report"
 UNKNOWN = "Unknown Report"
+PARSER_VERSION = "2026.10.21-multireport-v3"
 
 COLUMNS = [
     "Stage", "Machine", "Process Start", "Process End",
@@ -575,6 +576,10 @@ def parse_batch_cycle(source: Any, file_name: str = "") -> dict[str, Any]:
     # Each report may hold only part of the blending sequence. Preserve raw
     # boundary events and allow combine_reports() to stitch all report parts.
     blending_events = _extract_blending_events_fast(source)
+    if not blending_events.empty:
+        blending_events = blending_events.copy()
+        blending_events["Source Report"] = file_name
+        blending_events["Batch"] = _batch_number(overview_text, file_name)
 
     return {
         "Batch": _batch_number(overview_text, file_name),
@@ -744,3 +749,4 @@ def combine_reports(reports: list[dict[str, Any]]) -> pd.DataFrame:
         .sort_values(["Batch", "Process Start", "Stage", "Machine"])
         .reset_index(drop=True)
     )
+
