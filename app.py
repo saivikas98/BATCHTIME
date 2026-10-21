@@ -13,6 +13,8 @@ from parser import combine_reports, parse_pdf
 
 st.set_page_config(page_title="EB Execution Date Extractor", page_icon="📊", layout="wide")
 
+APP_VERSION = "2026.10.21-multireport-v3"
+
 MAX_DURATION_STAGES = {
     "Seal dry run", "Leak test", "Vacuum test (Max)",
     "Wetting", "Pre-mixing", "Mixing",
@@ -68,8 +70,126 @@ def excel_output(actual: pd.DataFrame, summaries: dict[str, pd.DataFrame], log: 
     return buffer.getvalue()
 
 
+
+def classify_merged_datalog(events: pd.DataFrame) -> pd.DataFrame:
+    """Add phase, duplicate, and boundary labels to merged datalog records."""
+    if events.empty:
+        return pd.DataFrame(
+            columns=[
+                "Batch", "Source Report", "Time", "Step", "Cycle", "Page",
+                "Phase classification", "Boundary role", "Duplicate status",
+            ]
+        )
+
+    result = events.copy().sort_values(["Time", "Source Report", "Page"])
+    result["Duplicate status"] = "Unique"
+    duplicate_mask = result.duplicated(
+        subset=["Time", "Step", "Cycle"], keep=False
+    )
+    result.loc[duplicate_mask, "Duplicate status"] = "Overlap across reports"
+
+    result["Phase classification"] = "Unclassified blending"
+    result["Boundary role"] = "Process record"
+
+    samples = result[result["Step"].isin(["sample: ips ph", "sample ips ph"])]
+    adjusts = result[result["Step"].eq("adjust ph")]
+    blending = result[result["Step"].str.startswith("blending to accumulator")]
+
+    first_sample = samples["Time"].min() if not samples.empty else pd.NaT
+    first_adjust = adjusts["Time"].min() if not adjusts.empty else pd.NaT
+    last_adjust = adjusts["Time"].max() if not adjusts.empty else pd.NaT
+    post_start_candidates = blending[
+        blending["Time"] > last_adjust
+    ] if pd.notna(last_adjust) else blending.iloc[0:0]
+    post_start = (
+        post_start_candidates["Time"].min()
+        if not post_start_candidates.empty else pd.NaT
+    )
+    sample2_candidates = samples[
+        samples["Time"] > post_start
+    ] if pd.notna(post_start) else samples.iloc[0:0]
+    first_sample2 = (
+        sample2_candidates["Time"].min()
+        if not sample2_candidates.empty else pd.NaT
+    )
+
+    if pd.notna(first_sample):
+        result.loc[result["Time"] < first_sample, "Phase classification"] = "Pre-pH blending"
+    if pd.notna(first_sample) and pd.notna(first_adjust):
+        result.loc[
+            (result["Time"] >= first_sample) & (result["Time"] < first_adjust),
+            "Phase classification",
+        ] = "pH sample 1"
+    if pd.notna(first_adjust) and pd.notna(post_start):
+        result.loc[
+            (result["Time"] >= first_adjust) & (result["Time"] < post_start),
+            "Phase classification",
+        ] = "pH adjustment"
+    if pd.notna(post_start) and pd.notna(first_sample2):
+        result.loc[
+            (result["Time"] >= post_start) & (result["Time"] < first_sample2),
+            "Phase classification",
+        ] = "Post-pH blending"
+    if pd.notna(first_sample2):
+        result.loc[result["Time"] >= first_sample2, "Phase classification"] = "pH sample 2"
+
+    # Mark the decisive transition rows used by the validator.
+    for cycle_value, label in ((60, "Pre-pH cycle completion"), (100, "Post-pH cycle completion")):
+        cycle_rows = result[
+            result["Step"].str.startswith("blending to accumulator")
+            & pd.to_numeric(result["Cycle"], errors="coerce").eq(cycle_value)
+        ]
+        if not cycle_rows.empty:
+            last_cycle_time = cycle_rows["Time"].max()
+            close_candidates = result[
+                (result["Step"] == "close 2mm orifice")
+                & (result["Time"] >= last_cycle_time)
+            ]
+            if not close_candidates.empty:
+                close_index = close_candidates.index[0]
+                result.loc[close_index, "Boundary role"] = label
+
+    if pd.notna(first_adjust):
+        first_adjust_index = result[
+            (result["Step"] == "adjust ph") & (result["Time"] == first_adjust)
+        ].index
+        if len(first_adjust_index):
+            result.loc[first_adjust_index[0], "Boundary role"] = "Adjust PH start"
+    if pd.notna(last_adjust):
+        last_adjust_index = result[
+            (result["Step"] == "adjust ph") & (result["Time"] == last_adjust)
+        ].index
+        if len(last_adjust_index):
+            result.loc[last_adjust_index[-1], "Boundary role"] = "Adjust PH end"
+
+    return result.reset_index(drop=True)
+
+
+def build_merged_datalog_preview(reports: list[dict[str, Any]]) -> pd.DataFrame:
+    """Merge raw datalog records batch-wise while retaining source reports."""
+    event_tables = []
+    for report in reports:
+        events = report.get("Blending Events", pd.DataFrame())
+        if events.empty:
+            continue
+        events = events.copy()
+        if "Batch" not in events.columns:
+            events["Batch"] = report.get("Batch", "UNKNOWN")
+        if "Source Report" not in events.columns:
+            events["Source Report"] = report.get("Source File", "Unknown file")
+        event_tables.append(events)
+
+    if not event_tables:
+        return classify_merged_datalog(pd.DataFrame())
+
+    merged = pd.concat(event_tables, ignore_index=True)
+    # Keep overlapping records in the preview so the user can verify report
+    # overlap. combine_reports() still removes duplicates for calculations.
+    return classify_merged_datalog(merged)
+
 def main() -> None:
     st.title("EB Execution Date Extractor")
+    st.caption(f"Build: {APP_VERSION}")
     st.caption(
         "Upload all report parts together. Files are grouped by the batch number inside each report; "
         "split operations are merged chronologically before phase validation."
@@ -112,7 +232,9 @@ def main() -> None:
                 "Rows extracted before merge": len(report.get("Rows", [])),
                 "Blending events": len(report.get("Blending Events", [])),
                 "Status": "Error" if error_message else "Part loaded",
-                "Message": error_message or "; ".join(map(str, warning_list)),
+                # Partial reports are expected. Blending validation is performed
+                # only after all report parts for the batch have been merged.
+                "Message": error_message,
             })
         except Exception as error:
             log_rows.append({
@@ -125,6 +247,7 @@ def main() -> None:
     status.info("Grouping report parts by batch number and merging operations...")
     log = pd.DataFrame(log_rows).sort_values(["Batch", "File"]).reset_index(drop=True)
     actual = combine_reports(reports)
+    merged_datalog = build_merged_datalog_preview(reports)
     progress.progress(1.0, text="Upload processing and batch merge complete")
     status.empty()
 
@@ -166,14 +289,80 @@ def main() -> None:
             )
         )
 
-    tabs = st.tabs(["Actual Process Time", "Summary", "Plots", "Extraction Log"])
+    tabs = st.tabs([
+        "Actual Process Time",
+        "Merged Datalog Preview",
+        "Summary",
+        "Plots",
+        "Extraction Log",
+    ])
     with tabs[0]:
         st.dataframe(format_dates(batch_table), use_container_width=True, hide_index=True)
 
     with tabs[1]:
-        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.subheader(f"{selected_batch} merged Blending Datalog")
+        batch_events = merged_datalog[
+            merged_datalog["Batch"].astype(str).eq(selected_batch)
+        ].copy()
+        if batch_events.empty:
+            st.info("No Blending Datalog records were extracted for this batch.")
+        else:
+            source_options = sorted(batch_events["Source Report"].dropna().unique().tolist())
+            phase_options = sorted(batch_events["Phase classification"].dropna().unique().tolist())
+            filter_1, filter_2, filter_3 = st.columns(3)
+            selected_sources = filter_1.multiselect(
+                "Source report", source_options, default=source_options,
+                key="datalog_sources",
+            )
+            selected_phases = filter_2.multiselect(
+                "Phase", phase_options, default=phase_options,
+                key="datalog_phases",
+            )
+            boundaries_only = filter_3.checkbox(
+                "Show boundary records only", value=False,
+                key="datalog_boundaries_only",
+            )
+
+            preview = batch_events[
+                batch_events["Source Report"].isin(selected_sources)
+                & batch_events["Phase classification"].isin(selected_phases)
+            ].copy()
+            if boundaries_only:
+                preview = preview[preview["Boundary role"] != "Process record"]
+
+            preview_display = preview.copy()
+            preview_display["Time"] = pd.to_datetime(
+                preview_display["Time"], errors="coerce"
+            ).dt.strftime("%d/%m/%Y %H:%M:%S")
+            preview_display = preview_display[
+                [
+                    "Batch", "Source Report", "Time", "Step", "Cycle", "Page",
+                    "Phase classification", "Boundary role", "Duplicate status",
+                ]
+            ]
+            st.caption(
+                f"Showing {len(preview_display):,} of {len(batch_events):,} merged records. "
+                "Overlap records are retained in this preview for traceability but "
+                "deduplicated before duration calculations."
+            )
+            st.dataframe(
+                preview_display,
+                use_container_width=True,
+                hide_index=True,
+                height=600,
+            )
+            st.download_button(
+                "Download merged datalog preview CSV",
+                preview_display.to_csv(index=False).encode("utf-8"),
+                file_name=f"{selected_batch}_merged_blending_datalog.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     with tabs[2]:
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    with tabs[3]:
         timeline = batch_table[
             batch_table["Validation"].astype(str).eq("OK")
         ].dropna(subset=["Process Start", "Process End"])
@@ -195,7 +384,7 @@ def main() -> None:
             summary_figure.update_yaxes(categoryorder="total ascending")
             st.plotly_chart(summary_figure, use_container_width=True)
 
-    with tabs[3]:
+    with tabs[4]:
         st.dataframe(log, use_container_width=True, hide_index=True)
 
     summaries = {
