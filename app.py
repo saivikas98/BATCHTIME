@@ -23,6 +23,13 @@ st.markdown(
     div[data-testid="stDataFrame"] {background:#ffffff; border:1px solid #d7deea; border-radius:10px; padding:4px;}
     .block-container {padding-top: 1.5rem; max-width: 1500px;}
     h1, h2, h3 {color:#17365d;}
+    .matrix-wrap {overflow-x:auto; border:1px solid #1f2937; background:white;}
+    .process-matrix {border-collapse:collapse; min-width:1450px; width:100%; font-size:15px; color:#111827;}
+    .process-matrix th, .process-matrix td {border:1px solid #1f2937; padding:6px 7px; text-align:center; white-space:nowrap;}
+    .process-matrix thead th {background:#ffffff; font-weight:800; font-size:16px;}
+    .process-matrix .section-cell {white-space:normal; min-width:170px; font-weight:800; vertical-align:middle;}
+    .process-matrix .stage-cell {text-align:left; min-width:175px; font-weight:800;}
+    .process-matrix .avg-cell {font-weight:900;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -219,6 +226,171 @@ def styled_cycle_summary(summary: pd.DataFrame):
         .set_properties(subset=["Stage"], **{"font-weight": "bold"})
     )
 
+
+BATCH_STRENGTH_DEFAULTS = {
+    "EG26040": "120 mg", "EG26042": "120 mg", "EG26050": "120 mg",
+    "EG26051": "120 mg", "EG26054": "120 mg", "EG26058": "120 mg",
+    "EG26060": "120 mg", "EG26061": "90 mg", "EG26063": "90 mg",
+    "EG26065": "90 mg", "EG26067": "60 mg", "EG26069": "60 mg",
+    "EG26070": "60 mg",
+}
+
+MATRIX_ROWS = [
+    ("Assembly -Manual", "Assembly", "Assembly -Manual"),
+    ("Seal dry run", "System integrity - Time from strt to end of the cycle", "SI elapsed Seal dry run"),
+    ("Leak test", "System integrity - Time from strt to end of the cycle", "SI elapsed Leak test"),
+    ("Vacuum test", "System integrity - Time from strt to end of the cycle", "SI elapsed Vacuum test"),
+    ("Seal dry run", "System integrity - (actual cycle time)", "SI actual Seal dry run"),
+    ("Leak test", "System integrity - (actual cycle time)", "SI actual Leak test"),
+    ("Vacuum test", "System integrity - (actual cycle time)", "SI actual Vacuum test"),
+    ("Water charging", "Gel manufacturing", "Water charging"),
+    ("API charging", "Gel manufacturing", "API charging"),
+    ("Wetting", "Gel manufacturing", "Wetting"),
+    ("Pre-mixing", "Gel manufacturing", "Pre-mixing"),
+    ("Mixing", "Gel manufacturing", "Mixing"),
+    ("Pre-pH Blending", "Gel manufacturing", "Pre-pH Blending"),
+    ("pH sample", "Gel manufacturing", "pH sample 1"),
+    ("pH adjustment", "Gel manufacturing", "pH adjustment"),
+    ("Post-pH blending", "Gel manufacturing", "Post-pH blending"),
+    ("pH sample", "Gel manufacturing", "pH sample 2"),
+    ("Filling setup", "Filling", "Filling setup"),
+    ("Filling", "Filling", "Filling"),
+]
+
+
+def _hours_between(start, end):
+    if pd.isna(start) or pd.isna(end):
+        return None
+    return round((end - start).total_seconds() / 3600, 2)
+
+
+def _batch_matrix_values(batch_table: pd.DataFrame, manual_hours: float) -> dict[str, float | None]:
+    values = {key: None for _, _, key in MATRIX_ROWS}
+    values["Assembly -Manual"] = round(float(manual_hours), 2)
+    valid = batch_table[batch_table["Validation"].astype(str).eq("OK")].copy()
+    valid["Process Start"] = pd.to_datetime(valid["Process Start"], errors="coerce")
+    valid["Process End"] = pd.to_datetime(valid["Process End"], errors="coerce")
+
+    for label, raw_stage in (
+        ("Seal dry run", "Seal dry run"),
+        ("Leak test", "Leak test"),
+        ("Vacuum test", "Vacuum test (Max)"),
+    ):
+        group = valid[valid["Stage"].eq(raw_stage)]
+        if not group.empty:
+            values[f"SI elapsed {label}"] = _hours_between(
+                group["Process Start"].min(), group["Process End"].max()
+            )
+            machine_cycles = []
+            for _, machine_group in group.groupby("Machine", dropna=False):
+                duration = _hours_between(
+                    machine_group["Process Start"].min(),
+                    machine_group["Process End"].max(),
+                )
+                if duration is not None:
+                    machine_cycles.append(duration)
+            values[f"SI actual {label}"] = max(machine_cycles) if machine_cycles else None
+
+    for stage in ("Wetting", "Pre-mixing", "Mixing"):
+        group = valid[valid["Stage"].eq(stage)]
+        durations = pd.to_numeric(group["Duration (hours)"], errors="coerce").dropna()
+        values[stage] = round(float(durations.max()), 2) if not durations.empty else None
+
+    for stage in ("Water charging", "API charging", "Pre-pH Blending", "pH adjustment",
+                  "Post-pH blending", "Filling setup", "Filling"):
+        group = valid[valid["Stage"].eq(stage)]
+        durations = pd.to_numeric(group["Duration (hours)"], errors="coerce").dropna()
+        values[stage] = round(float(durations.sum()), 2) if not durations.empty else None
+
+    ph = valid[valid["Stage"].eq("pH sample")].sort_values("Process Start")
+    ph_durations = pd.to_numeric(ph["Duration (hours)"], errors="coerce").dropna().tolist()
+    if ph_durations:
+        values["pH sample 1"] = round(float(ph_durations[0]), 2)
+    if len(ph_durations) > 1:
+        values["pH sample 2"] = round(float(ph_durations[-1]), 2)
+    return values
+
+
+def build_reference_matrix(actual: pd.DataFrame, batches: list[str], manual_hours: float) -> pd.DataFrame:
+    data = {}
+    for batch in batches:
+        data[batch] = _batch_matrix_values(
+            actual[actual["Batch"].astype(str).eq(batch)], manual_hours
+        )
+    rows = []
+    for display_stage, section, key in MATRIX_ROWS:
+        row = {"Section": section, "Stage": display_stage, "Key": key}
+        for batch in batches:
+            row[batch] = data[batch].get(key)
+        present = [row[b] for b in batches if row[b] is not None and not pd.isna(row[b])]
+        row["Average"] = round(sum(present) / len(present), 2) if present else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def render_reference_matrix(matrix: pd.DataFrame, batches: list[str], strengths: dict[str, str]) -> None:
+    colors = {
+        "Assembly": "#c8c19b",
+        "System integrity - Time from strt to end of the cycle": "#f9c08f",
+        "System integrity - (actual cycle time)": "#f5a25a",
+        "Gel manufacturing": "#aec5df",
+        "Filling": "#dfa8aa",
+    }
+    strength_groups = ["120 mg", "90 mg", "60 mg"]
+    grouped = {strength: [b for b in batches if strengths.get(b) == strength] for strength in strength_groups}
+    ordered_batches = [b for strength in strength_groups for b in grouped[strength]]
+    ordered_batches += [b for b in batches if b not in ordered_batches]
+
+    html = ['<div class="matrix-wrap"><table class="process-matrix">']
+    html.append('<thead><tr><th rowspan="3" colspan="2">Stage</th>')
+    html.append(f'<th colspan="{len(ordered_batches)+1}">Process time(hrs)</th></tr>')
+    html.append('<tr>')
+    for strength in strength_groups:
+        count = len(grouped[strength])
+        if count:
+            html.append(f'<th colspan="{count}">{strength}</th>')
+    other_count = len([b for b in ordered_batches if strengths.get(b) not in strength_groups])
+    if other_count:
+        html.append(f'<th colspan="{other_count}">Other</th>')
+    html.append('<th rowspan="2">Average</th></tr><tr>')
+    for batch in ordered_batches:
+        html.append(f'<th>{batch}</th>')
+    html.append('</tr></thead><tbody>')
+
+    section_counts = matrix["Section"].value_counts().to_dict()
+    rendered_sections = set()
+    for _, row in matrix.iterrows():
+        section = row["Section"]
+        color = colors.get(section, "#ffffff")
+        html.append(f'<tr style="background:{color}">')
+        if section not in rendered_sections:
+            label = section
+            if section == "Assembly":
+                label = "Assembly -Mannual"
+            html.append(f'<th class="section-cell" rowspan="{section_counts[section]}">{label}</th>')
+            rendered_sections.add(section)
+        html.append(f'<th class="stage-cell">{row["Stage"]}</th>')
+        for batch in ordered_batches:
+            value = row.get(batch)
+            html.append(f'<td>{"-" if pd.isna(value) else f"{float(value):.2f}"}</td>')
+        avg = row.get("Average")
+        html.append(f'<td class="avg-cell">{"-" if pd.isna(avg) else f"{float(avg):.2f}"}</td></tr>')
+    html.append('</tbody></table></div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+def build_major_totals(matrix: pd.DataFrame, batches: list[str]) -> pd.DataFrame:
+    result = pd.DataFrame(index=["Assembly -Mannual", "System integrity", "Gel manufacturing", "Filling"], columns=batches, dtype=float)
+    for batch in batches:
+        result.loc["Assembly -Mannual", batch] = matrix.loc[matrix["Key"].eq("Assembly -Manual"), batch].sum(min_count=1)
+        result.loc["System integrity", batch] = matrix.loc[matrix["Key"].str.startswith("SI actual"), batch].sum(min_count=1)
+        result.loc["Gel manufacturing", batch] = matrix.loc[matrix["Section"].eq("Gel manufacturing"), batch].sum(min_count=1)
+        result.loc["Filling", batch] = matrix.loc[matrix["Section"].eq("Filling"), batch].sum(min_count=1)
+    result.loc["Total time"] = result.sum(axis=0, min_count=1)
+    result["Average"] = result[batches].mean(axis=1).round(2)
+    result.index.name = "Stage"
+    return result.round(2)
+
 def main() -> None:
     st.title("EB Execution Date Extractor")
     st.caption(f"Build: {APP_VERSION}")
@@ -306,6 +478,23 @@ def main() -> None:
         return
 
     batches = actual["Batch"].dropna().astype(str).drop_duplicates().tolist()
+    with st.sidebar:
+        st.header("Reference Summary Settings")
+        manual_hours = st.number_input(
+            "Assembly - Manual (hours)", min_value=0.0, max_value=100.0,
+            value=16.0, step=0.5,
+        )
+        strengths = {}
+        for batch in batches:
+            options = ["120 mg", "90 mg", "60 mg", "Other"]
+            default = BATCH_STRENGTH_DEFAULTS.get(batch, "Other")
+            strengths[batch] = st.selectbox(
+                f"{batch} strength", options, index=options.index(default),
+                key=f"strength_{batch}",
+            )
+
+    reference_matrix = build_reference_matrix(actual, batches, manual_hours)
+    major_totals = build_major_totals(reference_matrix, batches)
     selected_batch = st.selectbox("Select batch", batches)
     batch_table = actual[actual["Batch"].astype(str).eq(selected_batch)].copy()
     summary = process_summary(batch_table)
@@ -324,8 +513,8 @@ def main() -> None:
     tabs = st.tabs([
         "Actual Process Time",
         "Merged Datalog Preview",
-        "Summary",
-        "Plots",
+        "Reference Process-Time Summary",
+        "Batch Comparison Plots",
         "Extraction Log",
     ])
     with tabs[0]:
@@ -392,43 +581,79 @@ def main() -> None:
             )
 
     with tabs[2]:
-        st.subheader("Cycle-Time Summary")
-        if summary.empty:
-            st.info("No validated cycle-time rows are available for this batch.")
-        else:
-            total_hours = float(summary["Process time (hours)"].sum())
-            longest = summary.loc[summary["Process time (hours)"].idxmax()]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total validated cycle time", f"{total_hours:.2f} h")
-            c2.metric("Longest operation", str(longest["Stage"]))
-            c3.metric("Longest duration", f"{float(longest['Process time (hours)']):.2f} h")
-            st.dataframe(
-                styled_cycle_summary(summary),
-                use_container_width=True,
-                hide_index=True,
-            )
+        st.subheader("Process Time Summary by Strength and Batch")
+        st.caption(
+            "This table matches the original layout: 120 mg, 90 mg, and 60 mg batch groups, "
+            "system-integrity elapsed and actual cycle times, gel-manufacturing stages, filling stages, and averages."
+        )
+        render_reference_matrix(reference_matrix, batches, strengths)
+        st.subheader("Total Process Time")
+        st.dataframe(
+            major_totals.reset_index().style.format(
+                {column: "{:.2f}" for column in [*batches, "Average"]}, na_rep="-"
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     with tabs[3]:
+        st.subheader("Batch Total Process-Time Comparison")
+        stage_totals = major_totals.drop(index="Total time")[batches].T.reset_index(names="Batch")
+        stage_totals["Strength"] = stage_totals["Batch"].map(strengths)
+        stacked = stage_totals.melt(
+            id_vars=["Batch", "Strength"],
+            value_vars=["Assembly -Mannual", "System integrity", "Gel manufacturing", "Filling"],
+            var_name="Stage", value_name="Hours",
+        )
+        stacked_fig = px.bar(
+            stacked, x="Batch", y="Hours", color="Stage", barmode="stack",
+            hover_data=["Strength"], text_auto=".1f",
+            color_discrete_map={
+                "Assembly -Mannual":"#c8c19b", "System integrity":"#f5a25a",
+                "Gel manufacturing":"#7fa7d1", "Filling":"#cf777b",
+            },
+            title="Stage contribution to total process time",
+        )
+        st.plotly_chart(stacked_fig, use_container_width=True)
+
+        left, right = st.columns(2)
+        with left:
+            heat = reference_matrix.set_index("Stage")[batches].copy()
+            heat.index = [f"{stage} ({key})" if list(reference_matrix["Stage"]).count(stage) > 1 else stage
+                          for stage, key in zip(reference_matrix["Stage"], reference_matrix["Key"])]
+            heat_fig = px.imshow(
+                heat, text_auto=".1f", aspect="auto", color_continuous_scale="RdYlBu_r",
+                labels={"x":"Batch", "y":"Process stage", "color":"Hours"},
+                title="Batch-to-batch process-time heatmap",
+            )
+            st.plotly_chart(heat_fig, use_container_width=True)
+        with right:
+            totals_plot = pd.DataFrame({
+                "Batch": batches,
+                "Total hours": major_totals.loc["Total time", batches].values,
+                "Strength": [strengths[b] for b in batches],
+            })
+            trend = px.line(
+                totals_plot, x="Batch", y="Total hours", color="Strength", markers=True,
+                title="Total process time by batch and strength",
+            )
+            trend.add_hline(
+                y=float(totals_plot["Total hours"].mean()), line_dash="dash",
+                annotation_text=f"Average {totals_plot['Total hours'].mean():.2f} h",
+            )
+            st.plotly_chart(trend, use_container_width=True)
+
         timeline = batch_table[
             batch_table["Validation"].astype(str).eq("OK")
         ].dropna(subset=["Process Start", "Process End"])
         if not timeline.empty:
-            figure = px.timeline(
-                timeline, x_start="Process Start", x_end="Process End",
-                y="Stage", color="Machine",
-                hover_data=["Duration (hours)", "Source"],
+            timeline_fig = px.timeline(
+                timeline, x_start="Process Start", x_end="Process End", y="Stage",
+                color="Machine", hover_data=["Duration (hours)", "Source"],
                 title=f"{selected_batch} merged execution timeline",
             )
-            figure.update_yaxes(autorange="reversed")
-            st.plotly_chart(figure, use_container_width=True)
-        if not summary.empty:
-            summary_figure = px.bar(
-                summary, x="Process time (hours)", y="Stage", orientation="h",
-                color="Process time (hours)", color_continuous_scale="Blues",
-                title=f"{selected_batch} process-time summary",
-            )
-            summary_figure.update_yaxes(categoryorder="total ascending")
-            st.plotly_chart(summary_figure, use_container_width=True)
+            timeline_fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(timeline_fig, use_container_width=True)
 
     with tabs[4]:
         st.dataframe(log, use_container_width=True, hide_index=True)
