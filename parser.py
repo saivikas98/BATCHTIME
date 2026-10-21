@@ -681,8 +681,61 @@ def combine_reports(reports: list[dict[str, Any]]) -> pd.DataFrame:
                     merged_events, blending_start, blending_end
                 )
                 if phases:
+                    # Enforce one continuous phase chain for every batch.
+                    # Pre-pH Blending always starts at MAX(end time of Mixing).
+                    mixing_rows = table[table["Stage"].eq("Mixing")]
+                    mixing_end = (
+                        pd.to_datetime(mixing_rows["Process End"], errors="coerce").max()
+                        if not mixing_rows.empty else blending_start
+                    )
+                    if pd.isna(mixing_end):
+                        mixing_end = blending_start
+
+                    phase_by_stage: dict[str, list[dict[str, Any]]] = {}
+                    for phase in phases:
+                        phase_by_stage.setdefault(phase["Stage"], []).append(phase)
+
+                    pre = phase_by_stage.get("Pre-pH Blending", [None])[0]
+                    samples = phase_by_stage.get("pH sample", [])
+                    adjustment = phase_by_stage.get("pH adjustment", [None])[0]
+                    post = phase_by_stage.get("Post-pH blending", [None])[0]
+
+                    if pre is not None:
+                        pre["Process Start"] = mixing_end
+                        pre["Duration (hours)"] = round(
+                            (pre["Process End"] - pre["Process Start"]).total_seconds() / 3600,
+                            4,
+                        )
+
+                    # Each next phase starts exactly at the previous phase end.
+                    ordered = []
+                    if pre is not None:
+                        ordered.append(pre)
+                    if samples:
+                        ordered.append(samples[0])
+                    if adjustment is not None:
+                        ordered.append(adjustment)
+                    if post is not None:
+                        ordered.append(post)
+                    if len(samples) > 1:
+                        ordered.append(samples[-1])
+
+                    for index in range(1, len(ordered)):
+                        ordered[index]["Process Start"] = ordered[index - 1]["Process End"]
+                        ordered[index]["Duration (hours)"] = round(
+                            (
+                                ordered[index]["Process End"]
+                                - ordered[index]["Process Start"]
+                            ).total_seconds() / 3600,
+                            4,
+                        )
+                        ordered[index]["Validation"] = (
+                            "OK" if ordered[index]["Duration (hours)"] >= 0
+                            else "End before start"
+                        )
+
                     table = pd.concat(
-                        [table, pd.DataFrame(phases, columns=COLUMNS)],
+                        [table, pd.DataFrame(ordered, columns=COLUMNS)],
                         ignore_index=True,
                     )
                 else:
