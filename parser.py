@@ -129,8 +129,17 @@ def detect_report_type(source: Any) -> str:
         "PRODUCTION COUNTERS" in probe or "EQUIPMENT ID" in probe
     ):
         return PFS
-    if "PROCESS OVERVIEW" in probe and any(
-        marker in probe for marker in ("WETTING", "PREMIXING", "MIXING EXTRUDER")
+    # Full reports normally contain Process Overview. Split continuation
+    # reports may begin directly at BLENDING DATALOG / Adjust PH and therefore
+    # must still be classified as Batch Cycle reports.
+    if (
+        "BATCH CYCLE REPORT" in probe
+        and (
+            "PROCESS OVERVIEW" in probe
+            or "BLENDING DATALOG" in probe
+            or "ADJUST PH" in probe
+            or "SAMPLE: IPS PH" in probe
+        )
     ):
         return BATCH
     return UNKNOWN
@@ -519,6 +528,13 @@ def _blending_phase_rows(
 
 
 def parse_batch_cycle(source: Any, file_name: str = "") -> dict[str, Any]:
+    """Parse one Batch Cycle PDF without assuming it contains all operations.
+
+    Blending validation is deliberately deferred to combine_reports(), where
+    events from every PDF belonging to the same batch are merged and sorted.
+    This supports split reports such as EG26050 part 1 (through pH sample 1)
+    and part 2 (Adjust PH, post-pH blending, and pH sample 2).
+    """
     reader = _reader(source)
     overview_text = _first_pages_text(reader, 4)
     raw_rows = _overview_rows(overview_text)
@@ -527,46 +543,49 @@ def parse_batch_cycle(source: Any, file_name: str = "") -> dict[str, Any]:
     for stage in ("Water charging", "API charging"):
         matching = [item for item in raw_rows if item["Stage"] == stage]
         if matching:
-            start = min(item["Process Start"] for item in matching)
-            end = max(item["Process End"] for item in matching)
+            start_time = min(item["Process Start"] for item in matching)
+            end_time = max(item["Process End"] for item in matching)
             rows.append(
                 _row(
-                    stage, stage, start, end,
+                    stage,
+                    stage,
+                    start_time,
+                    end_time,
                     "Minimum start to maximum end of Process Overview",
                     total=len(matching),
                 )
             )
 
     rows.extend(
-        item for item in raw_rows
+        item
+        for item in raw_rows
         if item["Stage"] not in {"Water charging", "API charging", "Blending"}
     )
 
-    blending_rows = [item for item in raw_rows if item["Stage"] == "Blending"]
-    warning_messages: list[str] = []
-    if blending_rows:
-        blending_start = min(item["Process Start"] for item in blending_rows)
-        blending_end = max(item["Process End"] for item in blending_rows)
-        events = _extract_blending_events_fast(source)
-        phases, validation = _blending_phase_rows(events, blending_start, blending_end)
-        if phases:
-            rows.extend(phases)
-        else:
-            diagnostic = _row(
-                "Blending", "Blending", blending_start, blending_end,
-                f"Validation failure - {validation['message']}",
-            )
-            diagnostic["Validation"] = validation["code"]
-            rows.append(diagnostic)
-            warning_messages.append(validation["code"])
+    overview_blending = [item for item in raw_rows if item["Stage"] == "Blending"]
+    overview_start = (
+        min(item["Process Start"] for item in overview_blending)
+        if overview_blending else None
+    )
+    overview_end = (
+        max(item["Process End"] for item in overview_blending)
+        if overview_blending else None
+    )
+
+    # Each report may hold only part of the blending sequence. Preserve raw
+    # boundary events and allow combine_reports() to stitch all report parts.
+    blending_events = _extract_blending_events_fast(source)
 
     return {
         "Batch": _batch_number(overview_text, file_name),
         "Report Type": BATCH,
         "Rows": pd.DataFrame(rows, columns=COLUMNS),
-        "Warnings": warning_messages,
+        "Blending Events": blending_events,
+        "Blending Overview Start": overview_start,
+        "Blending Overview End": overview_end,
+        "Source File": file_name,
+        "Warnings": [],
     }
-
 
 def parse_pfs(source: Any, file_name: str = "") -> dict[str, Any]:
     reader = _reader(source)
@@ -605,40 +624,123 @@ def parse_pdf(source: Any, file_name: str = "") -> dict[str, Any]:
 
 
 def combine_reports(reports: list[dict[str, Any]]) -> pd.DataFrame:
-    combined = []
+    """Merge all reports batch-wise, including split blending reports."""
+    combined_batches: list[pd.DataFrame] = []
+
     for batch in sorted({report["Batch"] for report in reports}):
         group = [report for report in reports if report["Batch"] == batch]
         tables = [report["Rows"] for report in group if not report["Rows"].empty]
-        if not tables:
-            continue
-        table = pd.concat(tables, ignore_index=True)
+        table = (
+            pd.concat(tables, ignore_index=True)
+            if tables else pd.DataFrame(columns=COLUMNS)
+        )
+
         cycle_reports = [
-            report for report in group
-            if report["Report Type"] == BATCH and not report["Rows"].empty
+            report for report in group if report["Report Type"] == BATCH
         ]
+        if cycle_reports:
+            event_tables = [
+                report.get("Blending Events", pd.DataFrame())
+                for report in cycle_reports
+                if not report.get("Blending Events", pd.DataFrame()).empty
+            ]
+            merged_events = (
+                pd.concat(event_tables, ignore_index=True)
+                .drop_duplicates(subset=["Time", "Step", "Cycle"])
+                .sort_values(["Time", "Page"])
+                .reset_index(drop=True)
+                if event_tables
+                else pd.DataFrame(columns=["Time", "Step", "Cycle", "Page"])
+            )
+
+            overview_starts = [
+                report.get("Blending Overview Start")
+                for report in cycle_reports
+                if report.get("Blending Overview Start") is not None
+            ]
+            overview_ends = [
+                report.get("Blending Overview End")
+                for report in cycle_reports
+                if report.get("Blending Overview End") is not None
+            ]
+
+            # A split continuation report may not repeat Process Overview.
+            # In that case use the event range to extend the overall interval.
+            event_start = merged_events["Time"].min() if not merged_events.empty else None
+            event_end = merged_events["Time"].max() if not merged_events.empty else None
+            blending_start = min(overview_starts + ([event_start] if event_start is not None else [])) if (overview_starts or event_start is not None) else None
+            blending_end = max(overview_ends + ([event_end] if event_end is not None else [])) if (overview_ends or event_end is not None) else None
+
+            if blending_start is not None and blending_end is not None:
+                phases, validation = _blending_phase_rows(
+                    merged_events, blending_start, blending_end
+                )
+                if phases:
+                    table = pd.concat(
+                        [table, pd.DataFrame(phases, columns=COLUMNS)],
+                        ignore_index=True,
+                    )
+                else:
+                    diagnostic = _row(
+                        "Blending",
+                        "Blending",
+                        blending_start,
+                        blending_end,
+                        f"Validation failure after merging {len(cycle_reports)} report(s): "
+                        f"{validation['message']}",
+                    )
+                    diagnostic["Validation"] = validation["code"]
+                    table = pd.concat(
+                        [table, pd.DataFrame([diagnostic])],
+                        ignore_index=True,
+                    )
+
         filling_reports = [
             report for report in group
             if report["Report Type"] == PFS and not report["Rows"].empty
         ]
-        if cycle_reports and filling_reports:
-            cycle_end = cycle_reports[0]["Rows"]["Process End"].max()
-            filling_start = filling_reports[0]["Rows"]["Process Start"].min()
-            if pd.notna(cycle_end) and pd.notna(filling_start) and filling_start >= cycle_end:
+        if cycle_reports and filling_reports and not table.empty:
+            cycle_rows = table[table["Stage"] != "Filling"]
+            cycle_end = cycle_rows["Process End"].max() if not cycle_rows.empty else None
+            filling_start = min(
+                report["Rows"]["Process Start"].min()
+                for report in filling_reports
+            )
+            if (
+                cycle_end is not None
+                and pd.notna(cycle_end)
+                and pd.notna(filling_start)
+                and filling_start >= cycle_end
+                and not (table["Stage"] == "Filling setup").any()
+            ):
                 table = pd.concat(
-                    [table, pd.DataFrame([_row(
-                        "Filling setup", "Inter-report gap",
-                        cycle_end, filling_start,
-                        "Batch-cycle end to PFS filling start",
-                    )])],
+                    [
+                        table,
+                        pd.DataFrame(
+                            [_row(
+                                "Filling setup",
+                                "Inter-report gap",
+                                cycle_end,
+                                filling_start,
+                                "Merged batch-cycle end to PFS filling start",
+                            )]
+                        ),
+                    ],
                     ignore_index=True,
                 )
-        table.insert(0, "Batch", batch)
-        combined.append(table)
 
-    if not combined:
+        if table.empty:
+            continue
+        table.insert(0, "Batch", batch)
+        combined_batches.append(table)
+
+    if not combined_batches:
         return pd.DataFrame(columns=["Batch", *COLUMNS])
     return (
-        pd.concat(combined, ignore_index=True)
+        pd.concat(combined_batches, ignore_index=True)
+        .drop_duplicates(
+            subset=["Batch", "Stage", "Machine", "Process Start", "Process End"]
+        )
         .sort_values(["Batch", "Process Start", "Stage", "Machine"])
         .reset_index(drop=True)
     )
