@@ -15,6 +15,17 @@ from typing import Any
 import pandas as pd
 from pypdf import PdfReader
 
+# PyMuPDF changed its preferred import name from ``fitz`` to ``pymupdf``.
+# Keep both paths and do not crash the Streamlit app if the optional fast
+# backend is temporarily unavailable during deployment.
+try:
+    import pymupdf as fitz
+except ImportError:
+    try:
+        import fitz  # type: ignore
+    except ImportError:
+        fitz = None  # type: ignore
+
 DT_FORMAT = "%d/%m/%Y %H:%M:%S"
 DT_PATTERN = r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}"
 BATCH_PATTERN = r"[A-Z]{2}\d{5}"
@@ -258,6 +269,80 @@ def _extract_blending_events(reader: PdfReader) -> pd.DataFrame:
     )
 
 
+def _extract_blending_events_fast(source: Any) -> pd.DataFrame:
+    """Extract blending boundaries quickly with PyMuPDF.
+
+    The previous pypdf page scan could exceed Streamlit Cloud execution limits
+    on 2,000+ page reports. PyMuPDF scans the same pages in seconds and returns
+    line-preserved text suitable for the report tables.
+    """
+    if fitz is None:
+        # Safe fallback. This is slower for very large reports, but it keeps
+        # the application operational if PyMuPDF is not installed yet.
+        return _extract_blending_events(_reader(source))
+
+    pdf_bytes = _read_bytes(source)
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    row_pattern = re.compile(
+        rf"(?m)^({DT_PATTERN})\s+"
+        rf"(Blending to accumulator (?:left|right)|Close 2mm Orifice|"
+        rf"Sample: IPS PH|Adjust PH)\s+(\d{{1,3}})\b",
+        re.IGNORECASE,
+    )
+    events: list[dict[str, Any]] = []
+    section_started = False
+    empty_after_section = 0
+
+    try:
+        for page_index in range(len(document)):
+            text = document.load_page(page_index).get_text("text", sort=True)
+            upper = text.upper()
+
+            if "BLENDING DATALOG" in upper:
+                section_started = True
+                empty_after_section = 0
+            elif section_started:
+                # Continuation pages may omit the repeated heading. Keep pages
+                # with known blending steps; stop after a sustained run of
+                # unrelated pages after the section.
+                has_step = any(
+                    token in upper
+                    for token in (
+                        "BLENDING TO ACCUMULATOR",
+                        "CLOSE 2MM ORIFICE",
+                        "SAMPLE: IPS PH",
+                        "ADJUST PH",
+                    )
+                )
+                empty_after_section = 0 if has_step else empty_after_section + 1
+                if empty_after_section >= 15:
+                    break
+
+            if not section_started:
+                continue
+
+            for match in row_pattern.finditer(text):
+                events.append(
+                    {
+                        "Time": _date(match.group(1)),
+                        "Step": _clean(match.group(2)).casefold(),
+                        "Cycle": int(match.group(3)),
+                        "Page": page_index + 1,
+                    }
+                )
+    finally:
+        document.close()
+
+    if not events:
+        return pd.DataFrame(columns=["Time", "Step", "Cycle", "Page"])
+    return (
+        pd.DataFrame(events)
+        .drop_duplicates(subset=["Time", "Step", "Cycle"])
+        .sort_values(["Time", "Page"])
+        .reset_index(drop=True)
+    )
+
+
 def _validate_blending_sequence(
     events: pd.DataFrame,
     blending_start: datetime,
@@ -462,7 +547,7 @@ def parse_batch_cycle(source: Any, file_name: str = "") -> dict[str, Any]:
     if blending_rows:
         blending_start = min(item["Process Start"] for item in blending_rows)
         blending_end = max(item["Process End"] for item in blending_rows)
-        events = _extract_blending_events(reader)
+        events = _extract_blending_events_fast(source)
         phases, validation = _blending_phase_rows(events, blending_start, blending_end)
         if phases:
             rows.extend(phases)
