@@ -13,7 +13,20 @@ from parser import combine_reports, parse_pdf
 
 st.set_page_config(page_title="EB Execution Date Extractor", page_icon="📊", layout="wide")
 
-APP_VERSION = "2026.10.21-multireport-v3"
+APP_VERSION = "2026.10.21-multireport-v4"
+
+st.markdown(
+    """
+    <style>
+    .stApp {background-color: #f5f7fb;}
+    div[data-testid="stMetric"] {background:#ffffff; border:1px solid #d7deea; padding:14px; border-radius:10px;}
+    div[data-testid="stDataFrame"] {background:#ffffff; border:1px solid #d7deea; border-radius:10px; padding:4px;}
+    .block-container {padding-top: 1.5rem; max-width: 1500px;}
+    h1, h2, h3 {color:#17365d;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 MAX_DURATION_STAGES = {
     "Seal dry run", "Leak test", "Vacuum test (Max)",
@@ -186,6 +199,25 @@ def build_merged_datalog_preview(reports: list[dict[str, Any]]) -> pd.DataFrame:
     # Keep overlapping records in the preview so the user can verify report
     # overlap. combine_reports() still removes duplicates for calculations.
     return classify_merged_datalog(merged)
+
+
+def styled_cycle_summary(summary: pd.DataFrame):
+    """Apply the original stage-color theme to the cycle-time summary."""
+    def row_style(row: pd.Series) -> list[str]:
+        stage = str(row.get("Stage", ""))
+        if stage in {"Seal dry run", "Leak test", "Vacuum test (Max)"}:
+            color = "#f7b177"
+        elif stage in {"Filling setup", "Filling"}:
+            color = "#dfacad"
+        else:
+            color = "#adc3dc"
+        return [f"background-color: {color}; color: #172033"] * len(row)
+    return (
+        summary.style
+        .format({"Process time (hours)": "{:.3f}"}, na_rep="-")
+        .apply(row_style, axis=1)
+        .set_properties(subset=["Stage"], **{"font-weight": "bold"})
+    )
 
 def main() -> None:
     st.title("EB Execution Date Extractor")
@@ -360,7 +392,21 @@ def main() -> None:
             )
 
     with tabs[2]:
-        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.subheader("Cycle-Time Summary")
+        if summary.empty:
+            st.info("No validated cycle-time rows are available for this batch.")
+        else:
+            total_hours = float(summary["Process time (hours)"].sum())
+            longest = summary.loc[summary["Process time (hours)"].idxmax()]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total validated cycle time", f"{total_hours:.2f} h")
+            c2.metric("Longest operation", str(longest["Stage"]))
+            c3.metric("Longest duration", f"{float(longest['Process time (hours)']):.2f} h")
+            st.dataframe(
+                styled_cycle_summary(summary),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     with tabs[3]:
         timeline = batch_table[
