@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import gc
 from collections import OrderedDict
 from typing import Any
 
@@ -14,7 +15,7 @@ from parser import combine_reports, parse_pdf
 
 st.set_page_config(page_title="EB Execution Date Extractor", page_icon="📊", layout="wide")
 
-APP_VERSION = "2026.10.22-cache-download-v6"
+APP_VERSION = "2026.10.22-interactive-summary-v8"
 
 st.markdown(
     """
@@ -329,56 +330,132 @@ def build_reference_matrix(actual: pd.DataFrame, batches: list[str], manual_hour
     return pd.DataFrame(rows)
 
 
-def render_reference_matrix(matrix: pd.DataFrame, batches: list[str], strengths: dict[str, str]) -> None:
+def render_reference_matrix(
+    matrix: pd.DataFrame,
+    batches: list[str],
+    strengths: dict[str, str],
+) -> None:
+    """Render a native, filterable Streamlit process-time table.
+
+    Unlike the former pasted-looking HTML table, this uses Streamlit's native
+    dataframe surface, so users can sort columns, resize them, search, and open
+    the table in full-screen mode.
+    """
+    section_options = matrix["Section"].drop_duplicates().tolist()
+    available_strengths = [
+        strength
+        for strength in ("120 mg", "90 mg", "60 mg", "Other")
+        if any(strengths.get(batch) == strength for batch in batches)
+    ]
+
+    control_1, control_2, control_3 = st.columns([1.15, 2.2, 1.0])
+    selected_strength = control_1.selectbox(
+        "Strength view",
+        ["All strengths", *available_strengths],
+        key="summary_strength_view",
+    )
+    selected_sections = control_2.multiselect(
+        "Process sections",
+        section_options,
+        default=section_options,
+        key="summary_section_filter",
+    )
+    show_average = control_3.toggle(
+        "Show average",
+        value=True,
+        key="summary_show_average",
+    )
+
+    if selected_strength == "All strengths":
+        visible_batches = [
+            batch
+            for strength in ("120 mg", "90 mg", "60 mg", "Other")
+            for batch in batches
+            if strengths.get(batch) == strength
+        ]
+        visible_batches += [batch for batch in batches if batch not in visible_batches]
+    else:
+        visible_batches = [
+            batch for batch in batches
+            if strengths.get(batch) == selected_strength
+        ]
+
+    filtered = matrix[matrix["Section"].isin(selected_sections)].copy()
+    display_columns = ["Section", "Stage", *visible_batches]
+    if show_average:
+        display_columns.append("Average")
+    display = filtered[display_columns].reset_index(drop=True)
+
     colors = {
-        "Assembly": "#c8c19b",
-        "System integrity - Time from strt to end of the cycle": "#f9c08f",
-        "System integrity - (actual cycle time)": "#f5a25a",
-        "Gel manufacturing": "#aec5df",
-        "Filling": "#dfa8aa",
+        "Assembly": "#d7d1ad",
+        "System integrity - Time from strt to end of the cycle": "#ffd1a8",
+        "System integrity - (actual cycle time)": "#ffad63",
+        "Gel manufacturing": "#c4d7eb",
+        "Filling": "#edc1c3",
     }
-    strength_groups = ["120 mg", "90 mg", "60 mg"]
-    grouped = {strength: [b for b in batches if strengths.get(b) == strength] for strength in strength_groups}
-    ordered_batches = [b for strength in strength_groups for b in grouped[strength]]
-    ordered_batches += [b for b in batches if b not in ordered_batches]
 
-    html = ['<div class="matrix-wrap"><table class="process-matrix">']
-    html.append('<thead><tr><th rowspan="3" colspan="2">Stage</th>')
-    html.append(f'<th colspan="{len(ordered_batches)+1}">Process time(hrs)</th></tr>')
-    html.append('<tr>')
-    for strength in strength_groups:
-        count = len(grouped[strength])
-        if count:
-            html.append(f'<th colspan="{count}">{strength}</th>')
-    other_count = len([b for b in ordered_batches if strengths.get(b) not in strength_groups])
-    if other_count:
-        html.append(f'<th colspan="{other_count}">Other</th>')
-    html.append('<th rowspan="2">Average</th></tr><tr>')
-    for batch in ordered_batches:
-        html.append(f'<th>{batch}</th>')
-    html.append('</tr></thead><tbody>')
+    numeric_columns = [
+        column for column in display.columns
+        if column not in {"Section", "Stage"}
+    ]
 
-    section_counts = matrix["Section"].value_counts().to_dict()
-    rendered_sections = set()
-    for _, row in matrix.iterrows():
-        section = row["Section"]
-        color = colors.get(section, "#ffffff")
-        html.append(f'<tr style="background:{color}">')
-        if section not in rendered_sections:
-            label = section
-            if section == "Assembly":
-                label = "Assembly -Mannual"
-            html.append(f'<th class="section-cell" rowspan="{section_counts[section]}">{label}</th>')
-            rendered_sections.add(section)
-        html.append(f'<th class="stage-cell">{row["Stage"]}</th>')
-        for batch in ordered_batches:
-            value = row.get(batch)
-            html.append(f'<td>{"-" if pd.isna(value) else f"{float(value):.2f}"}</td>')
-        avg = row.get("Average")
-        html.append(f'<td class="avg-cell">{"-" if pd.isna(avg) else f"{float(avg):.2f}"}</td></tr>')
-    html.append('</tbody></table></div>')
-    st.markdown("".join(html), unsafe_allow_html=True)
+    def color_row(row: pd.Series) -> list[str]:
+        color = colors.get(str(row["Section"]), "#ffffff")
+        return [f"background-color: {color}; color: #172033"] * len(row)
 
+    styled = (
+        display.style
+        .format({column: "{:.2f}" for column in numeric_columns}, na_rep="-")
+        .apply(color_row, axis=1)
+        .set_properties(subset=["Section", "Stage"], **{"font-weight": "600"})
+    )
+
+    st.caption(
+        f"Showing {len(display)} process rows across {len(visible_batches)} batch(es). "
+        "Use the column headers to sort, drag column boundaries to resize, or "
+        "open full screen from the table toolbar."
+    )
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        hide_index=True,
+        height=min(720, 92 + 36 * max(len(display), 1)),
+        column_config={
+            "Section": st.column_config.TextColumn("Process section", width="large"),
+            "Stage": st.column_config.TextColumn("Stage", width="medium"),
+            **{
+                column: st.column_config.NumberColumn(
+                    column,
+                    help=f"Process time for {column}, hours",
+                    format="%.2f",
+                    width="small",
+                )
+                for column in numeric_columns
+            },
+        },
+    )
+
+    # Compact visual comparison for the currently filtered table.
+    if visible_batches and not filtered.empty:
+        chart_data = filtered.set_index("Stage")[visible_batches].copy()
+        chart_data = chart_data.loc[chart_data.notna().any(axis=1)]
+        if not chart_data.empty:
+            with st.expander("Quick visual comparison", expanded=False):
+                long_data = (
+                    chart_data.reset_index()
+                    .melt(id_vars="Stage", var_name="Batch", value_name="Hours")
+                    .dropna(subset=["Hours"])
+                )
+                comparison = px.bar(
+                    long_data,
+                    x="Stage",
+                    y="Hours",
+                    color="Batch",
+                    barmode="group",
+                    title="Selected process rows by batch",
+                )
+                comparison.update_layout(xaxis_tickangle=-35, height=460)
+                st.plotly_chart(comparison, use_container_width=True)
 
 def build_major_totals(matrix: pd.DataFrame, batches: list[str]) -> pd.DataFrame:
     result = pd.DataFrame(index=["Assembly -Mannual", "System integrity", "Gel manufacturing", "Filling"], columns=batches, dtype=float)
@@ -393,19 +470,21 @@ def build_major_totals(matrix: pd.DataFrame, batches: list[str]) -> pd.DataFrame
     return result.round(2)
 
 
-@st.cache_data(show_spinner=False, max_entries=64)
-def parse_pdf_cached(file_name: str, file_bytes: bytes) -> dict[str, Any]:
-    """Parse a PDF once for the exact file content and reuse the result."""
-    return parse_pdf(file_bytes, file_name)
-
-
-def upload_fingerprint(payloads: list[tuple[str, bytes]]) -> str:
-    """Create a stable key that changes only when uploaded documents change."""
+def upload_fingerprint(files) -> str:
+    """Create a lightweight key that changes when uploaded documents change."""
     digest = hashlib.sha256()
-    for file_name, file_bytes in sorted(payloads, key=lambda item: item[0].casefold()):
-        digest.update(file_name.encode("utf-8", errors="ignore"))
-        digest.update(len(file_bytes).to_bytes(8, "big"))
-        digest.update(hashlib.sha256(file_bytes).digest())
+    for uploaded in sorted(files, key=lambda item: item.name.casefold()):
+        size = int(getattr(uploaded, "size", 0) or 0)
+        digest.update(uploaded.name.encode("utf-8", errors="ignore"))
+        digest.update(size.to_bytes(8, "big"))
+        # Hash only edge samples. Avoid making and hashing another full-size
+        # copy of every large PDF during every Streamlit rerun.
+        uploaded.seek(0)
+        digest.update(uploaded.read(min(size, 65536)))
+        if size > 65536:
+            uploaded.seek(max(0, size - 65536))
+            digest.update(uploaded.read(65536))
+        uploaded.seek(0)
     return digest.hexdigest()
 
 
@@ -463,43 +542,45 @@ def main() -> None:
         st.info("Select all available PDF parts for the required batches.")
         return
 
-    # Convert uploads to immutable bytes. The fingerprint changes only when a
-    # file is added, removed, renamed, or its content changes.
-    payloads = [(uploaded.name, uploaded.getvalue()) for uploaded in files]
-    document_key = upload_fingerprint(payloads)
-    total_bytes = sum(len(file_bytes) for _, file_bytes in payloads)
+    # Streamlit retains UploadedFile objects while they remain selected. Keep
+    # only compact extracted results in session state, never raw PDF bytes or
+    # duplicated parsed-report structures.
+    document_key = upload_fingerprint(files)
+    total_bytes = sum(int(getattr(item, "size", 0) or 0) for item in files)
     size_text = f" ({total_bytes / 1024 / 1024:.1f} MB)" if total_bytes else ""
-    st.write(f"**{len(payloads)} document(s) received{size_text}.**")
+    st.write(f"**{len(files)} document(s) received{size_text}.**")
 
-    # Streamlit reruns the script for widgets and downloads. Reuse the complete
-    # extraction result while the uploaded-document fingerprint is unchanged.
     cached_key = st.session_state.get("processed_document_key")
-    if cached_key == document_key and "processed_reports" in st.session_state:
-        reports = st.session_state["processed_reports"]
+    required_keys = {
+        "processed_log", "processed_actual", "processed_merged_datalog"
+    }
+    if cached_key == document_key and required_keys.issubset(st.session_state):
         log = st.session_state["processed_log"]
         actual = st.session_state["processed_actual"]
         merged_datalog = st.session_state["processed_merged_datalog"]
-        st.success("Using previously extracted results. No PDF reprocessing was performed.")
+        st.success("Using extracted results from this session. No PDF reprocessing was performed.")
     else:
         progress = st.progress(0, text="Preparing uploaded documents...")
         status = st.empty()
         reports: list[dict[str, Any]] = []
         log_rows: list[dict[str, Any]] = []
+        sorted_files = sorted(files, key=lambda item: item.name.casefold())
 
-        sorted_payloads = sorted(payloads, key=lambda item: item[0].casefold())
-        for index, (file_name, file_bytes) in enumerate(sorted_payloads, start=1):
+        for index, uploaded in enumerate(sorted_files, start=1):
             progress.progress(
-                (index - 1) / len(sorted_payloads),
-                text=f"Extracting {file_name} ({index}/{len(sorted_payloads)})",
+                (index - 1) / len(sorted_files),
+                text=f"Extracting {uploaded.name} ({index}/{len(sorted_files)})",
             )
-            status.info(f"Reading report structure and datalog: {file_name}")
+            status.info(f"Reading report structure and datalog: {uploaded.name}")
             try:
-                report = parse_pdf_cached(file_name, file_bytes)
+                uploaded.seek(0)
+                report = parse_pdf(uploaded, uploaded.name)
+                uploaded.seek(0)
                 reports.append(report)
                 error_message = report.get("Error", "")
                 log_rows.append({
                     "Batch": report.get("Batch", "UNKNOWN"),
-                    "File": file_name,
+                    "File": uploaded.name,
                     "Report type": report.get("Report Type", "Unknown"),
                     "Rows extracted before merge": len(report.get("Rows", [])),
                     "Blending events": len(report.get("Blending Events", [])),
@@ -508,14 +589,14 @@ def main() -> None:
                 })
             except Exception as error:
                 log_rows.append({
-                    "Batch": "UNKNOWN", "File": file_name,
+                    "Batch": "UNKNOWN", "File": uploaded.name,
                     "Report type": "Error", "Rows extracted before merge": 0,
                     "Blending events": 0, "Status": "Failed",
                     "Message": str(error),
                 })
             progress.progress(
-                index / len(sorted_payloads),
-                text=f"Processed {index}/{len(sorted_payloads)} documents",
+                index / len(sorted_files),
+                text=f"Processed {index}/{len(sorted_files)} documents",
             )
 
         status.info("Grouping report parts by batch number and merging operations...")
@@ -523,11 +604,15 @@ def main() -> None:
         actual = combine_reports(reports)
         merged_datalog = build_merged_datalog_preview(reports)
 
+        # Store only the merged compact outputs. Do not store raw PDFs and do
+        # not keep the per-report event tables a second time.
         st.session_state["processed_document_key"] = document_key
-        st.session_state["processed_reports"] = reports
         st.session_state["processed_log"] = log
         st.session_state["processed_actual"] = actual
         st.session_state["processed_merged_datalog"] = merged_datalog
+        st.session_state.pop("processed_reports", None)
+        del reports
+        gc.collect()
 
         progress.progress(1.0, text="Extraction and batch merge complete")
         status.empty()
@@ -690,12 +775,51 @@ def main() -> None:
             )
 
         st.subheader("Total Process Time")
+        total_strength = st.radio(
+            "Total table strength",
+            ["All strengths", "120 mg", "90 mg", "60 mg"],
+            horizontal=True,
+            key="total_strength_filter",
+        )
+        total_batches = (
+            batches
+            if total_strength == "All strengths"
+            else [batch for batch in batches if strengths.get(batch) == total_strength]
+        )
+        total_columns = [*total_batches, "Average"]
+        total_display = major_totals[total_columns].reset_index()
+
+        def total_row_style(row: pd.Series) -> list[str]:
+            stage = str(row["Stage"])
+            color = {
+                "Assembly -Mannual": "#d7d1ad",
+                "System integrity": "#ffad63",
+                "Gel manufacturing": "#c4d7eb",
+                "Filling": "#edc1c3",
+                "Total time": "#dbeafe",
+            }.get(stage, "#ffffff")
+            weight = "700" if stage == "Total time" else "500"
+            return [f"background-color:{color}; font-weight:{weight}; color:#172033"] * len(row)
+
+        total_style = (
+            total_display.style
+            .format({column: "{:.2f}" for column in total_columns}, na_rep="-")
+            .apply(total_row_style, axis=1)
+        )
         st.dataframe(
-            major_totals.reset_index().style.format(
-                {column: "{:.2f}" for column in [*batches, "Average"]}, na_rep="-"
-            ),
+            total_style,
             use_container_width=True,
             hide_index=True,
+            height=248,
+            column_config={
+                "Stage": st.column_config.TextColumn("Stage", width="medium"),
+                **{
+                    column: st.column_config.NumberColumn(
+                        column, format="%.2f", width="small"
+                    )
+                    for column in total_columns
+                },
+            },
         )
 
     with tabs[3]:
