@@ -7,15 +7,11 @@ import gc
 from collections import OrderedDict
 from typing import Any
 
-import pandas as pd
-import plotly.express as px
 import streamlit as st
-
-from parser import combine_reports, parse_pdf
 
 st.set_page_config(page_title="EB Execution Date Extractor", page_icon="📊", layout="wide")
 
-APP_VERSION = "2026.10.22-interactive-summary-v8"
+APP_VERSION = "2026.10.22-fast-launch-v9"
 
 st.markdown(
     """
@@ -533,14 +529,33 @@ def main() -> None:
         "split operations are merged chronologically before phase validation."
     )
 
+    action_1, action_2 = st.columns([4, 1])
+    with action_2:
+        if st.button("Clear session", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
     files = st.file_uploader(
         "Upload System Integrity, Batch Cycle, continuation, and PFS Filling PDFs",
         type=["pdf"],
         accept_multiple_files=True,
+        key="batch_pdf_uploads",
     )
     if not files:
         st.info("Select all available PDF parts for the required batches.")
+        st.caption(
+            "The PDF engine, analytics libraries, and charts are loaded only after "
+            "documents are selected. This keeps the app landing page lightweight."
+        )
         return
+
+    # Heavy libraries are imported only after documents have been selected.
+    # This significantly reduces cold-start time when opening the app.
+    global pd, px
+    import pandas as pd
+    import plotly.express as px
+    from parser import parse_pdf, combine_reports
 
     # Streamlit retains UploadedFile objects while they remain selected. Keep
     # only compact extracted results in session state, never raw PDF bytes or
