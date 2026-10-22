@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 from collections import OrderedDict
 from typing import Any
 
@@ -13,7 +14,7 @@ from parser import combine_reports, parse_pdf
 
 st.set_page_config(page_title="EB Execution Date Extractor", page_icon="📊", layout="wide")
 
-APP_VERSION = "2026.10.21-multireport-v4"
+APP_VERSION = "2026.10.22-cache-download-v6"
 
 st.markdown(
     """
@@ -391,6 +392,60 @@ def build_major_totals(matrix: pd.DataFrame, batches: list[str]) -> pd.DataFrame
     result.index.name = "Stage"
     return result.round(2)
 
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def parse_pdf_cached(file_name: str, file_bytes: bytes) -> dict[str, Any]:
+    """Parse a PDF once for the exact file content and reuse the result."""
+    return parse_pdf(file_bytes, file_name)
+
+
+def upload_fingerprint(payloads: list[tuple[str, bytes]]) -> str:
+    """Create a stable key that changes only when uploaded documents change."""
+    digest = hashlib.sha256()
+    for file_name, file_bytes in sorted(payloads, key=lambda item: item[0].casefold()):
+        digest.update(file_name.encode("utf-8", errors="ignore"))
+        digest.update(len(file_bytes).to_bytes(8, "big"))
+        digest.update(hashlib.sha256(file_bytes).digest())
+    return digest.hexdigest()
+
+
+def reference_summary_excel(
+    matrix: pd.DataFrame,
+    totals: pd.DataFrame,
+    batches: list[str],
+    strengths: dict[str, str],
+) -> bytes:
+    """Export the strength-and-batch matrix and total-process-time table."""
+    output = io.BytesIO()
+    matrix_export = matrix.drop(columns=["Key"]).copy()
+    strength_row = pd.DataFrame(
+        [{
+            "Section": "Strength",
+            "Stage": "Strength",
+            **{batch: strengths.get(batch, "Other") for batch in batches},
+            "Average": "All batches",
+        }]
+    )
+    matrix_export = pd.concat([strength_row, matrix_export], ignore_index=True)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        matrix_export.to_excel(
+            writer, index=False, sheet_name="Process Time Summary"
+        )
+        totals.reset_index().to_excel(
+            writer, index=False, sheet_name="Total Process Time"
+        )
+        for worksheet in writer.book.worksheets:
+            worksheet.freeze_panes = "C2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for column_cells in worksheet.columns:
+                width = min(
+                    max(len(str(cell.value or "")) for cell in column_cells) + 2,
+                    42,
+                )
+                worksheet.column_dimensions[column_cells[0].column_letter].width = width
+    return output.getvalue()
+
 def main() -> None:
     st.title("EB Execution Date Extractor")
     st.caption(f"Build: {APP_VERSION}")
@@ -408,52 +463,74 @@ def main() -> None:
         st.info("Select all available PDF parts for the required batches.")
         return
 
-    total_bytes = sum(int(getattr(file, "size", 0) or 0) for file in files)
+    # Convert uploads to immutable bytes. The fingerprint changes only when a
+    # file is added, removed, renamed, or its content changes.
+    payloads = [(uploaded.name, uploaded.getvalue()) for uploaded in files]
+    document_key = upload_fingerprint(payloads)
+    total_bytes = sum(len(file_bytes) for _, file_bytes in payloads)
     size_text = f" ({total_bytes / 1024 / 1024:.1f} MB)" if total_bytes else ""
-    st.write(f"**{len(files)} document(s) received{size_text}.**")
+    st.write(f"**{len(payloads)} document(s) received{size_text}.**")
 
-    progress = st.progress(0, text="Preparing uploaded documents...")
-    status = st.empty()
-    reports: list[dict[str, Any]] = []
-    log_rows: list[dict[str, Any]] = []
+    # Streamlit reruns the script for widgets and downloads. Reuse the complete
+    # extraction result while the uploaded-document fingerprint is unchanged.
+    cached_key = st.session_state.get("processed_document_key")
+    if cached_key == document_key and "processed_reports" in st.session_state:
+        reports = st.session_state["processed_reports"]
+        log = st.session_state["processed_log"]
+        actual = st.session_state["processed_actual"]
+        merged_datalog = st.session_state["processed_merged_datalog"]
+        st.success("Using previously extracted results. No PDF reprocessing was performed.")
+    else:
+        progress = st.progress(0, text="Preparing uploaded documents...")
+        status = st.empty()
+        reports: list[dict[str, Any]] = []
+        log_rows: list[dict[str, Any]] = []
 
-    # Sort input names for deterministic processing. Final grouping is based on
-    # batch number extracted from report content, not on upload order.
-    sorted_files = sorted(files, key=lambda item: item.name.casefold())
-    for index, uploaded in enumerate(sorted_files, start=1):
-        percent = (index - 1) / len(sorted_files)
-        progress.progress(percent, text=f"Reading {uploaded.name} ({index}/{len(sorted_files)})")
-        status.info(f"Extracting report structure and datalog: {uploaded.name}")
-        try:
-            report = parse_pdf(uploaded, uploaded.name)
-            reports.append(report)
-            warning_list = report.get("Warnings", [])
-            error_message = report.get("Error", "")
-            log_rows.append({
-                "Batch": report.get("Batch", "UNKNOWN"),
-                "File": uploaded.name,
-                "Report type": report.get("Report Type", "Unknown"),
-                "Rows extracted before merge": len(report.get("Rows", [])),
-                "Blending events": len(report.get("Blending Events", [])),
-                "Status": "Error" if error_message else "Part loaded",
-                # Partial reports are expected. Blending validation is performed
-                # only after all report parts for the batch have been merged.
-                "Message": error_message,
-            })
-        except Exception as error:
-            log_rows.append({
-                "Batch": "UNKNOWN", "File": uploaded.name, "Report type": "Error",
-                "Rows extracted before merge": 0, "Blending events": 0,
-                "Status": "Failed", "Message": str(error),
-            })
-        progress.progress(index / len(sorted_files), text=f"Processed {index}/{len(sorted_files)} documents")
+        sorted_payloads = sorted(payloads, key=lambda item: item[0].casefold())
+        for index, (file_name, file_bytes) in enumerate(sorted_payloads, start=1):
+            progress.progress(
+                (index - 1) / len(sorted_payloads),
+                text=f"Extracting {file_name} ({index}/{len(sorted_payloads)})",
+            )
+            status.info(f"Reading report structure and datalog: {file_name}")
+            try:
+                report = parse_pdf_cached(file_name, file_bytes)
+                reports.append(report)
+                error_message = report.get("Error", "")
+                log_rows.append({
+                    "Batch": report.get("Batch", "UNKNOWN"),
+                    "File": file_name,
+                    "Report type": report.get("Report Type", "Unknown"),
+                    "Rows extracted before merge": len(report.get("Rows", [])),
+                    "Blending events": len(report.get("Blending Events", [])),
+                    "Status": "Error" if error_message else "Part loaded",
+                    "Message": error_message,
+                })
+            except Exception as error:
+                log_rows.append({
+                    "Batch": "UNKNOWN", "File": file_name,
+                    "Report type": "Error", "Rows extracted before merge": 0,
+                    "Blending events": 0, "Status": "Failed",
+                    "Message": str(error),
+                })
+            progress.progress(
+                index / len(sorted_payloads),
+                text=f"Processed {index}/{len(sorted_payloads)} documents",
+            )
 
-    status.info("Grouping report parts by batch number and merging operations...")
-    log = pd.DataFrame(log_rows).sort_values(["Batch", "File"]).reset_index(drop=True)
-    actual = combine_reports(reports)
-    merged_datalog = build_merged_datalog_preview(reports)
-    progress.progress(1.0, text="Upload processing and batch merge complete")
-    status.empty()
+        status.info("Grouping report parts by batch number and merging operations...")
+        log = pd.DataFrame(log_rows).sort_values(["Batch", "File"]).reset_index(drop=True)
+        actual = combine_reports(reports)
+        merged_datalog = build_merged_datalog_preview(reports)
+
+        st.session_state["processed_document_key"] = document_key
+        st.session_state["processed_reports"] = reports
+        st.session_state["processed_log"] = log
+        st.session_state["processed_actual"] = actual
+        st.session_state["processed_merged_datalog"] = merged_datalog
+
+        progress.progress(1.0, text="Extraction and batch merge complete")
+        status.empty()
 
     st.subheader("Batch-wise Report Grouping")
     grouped = (
@@ -578,6 +655,7 @@ def main() -> None:
                 file_name=f"{selected_batch}_merged_blending_datalog.csv",
                 mime="text/csv",
                 use_container_width=True,
+                on_click="ignore",
             )
 
     with tabs[2]:
@@ -587,6 +665,30 @@ def main() -> None:
             "system-integrity elapsed and actual cycle times, gel-manufacturing stages, filling stages, and averages."
         )
         render_reference_matrix(reference_matrix, batches, strengths)
+
+        summary_download_1, summary_download_2 = st.columns(2)
+        summary_flat = reference_matrix.drop(columns=["Key"]).copy()
+        with summary_download_1:
+            st.download_button(
+                "Download Process Time Summary - Excel",
+                data=reference_summary_excel(
+                    reference_matrix, major_totals, batches, strengths
+                ),
+                file_name="Process_Time_Summary_by_Strength_and_Batch.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                on_click="ignore",
+            )
+        with summary_download_2:
+            st.download_button(
+                "Download Process Time Summary - CSV",
+                data=summary_flat.to_csv(index=False).encode("utf-8"),
+                file_name="Process_Time_Summary_by_Strength_and_Batch.csv",
+                mime="text/csv",
+                use_container_width=True,
+                on_click="ignore",
+            )
+
         st.subheader("Total Process Time")
         st.dataframe(
             major_totals.reset_index().style.format(
@@ -668,6 +770,7 @@ def main() -> None:
         file_name="EB_execution_dates_merged_by_batch.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
+        on_click="ignore",
     )
 
 
