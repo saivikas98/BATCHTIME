@@ -803,4 +803,3 @@ def combine_reports(reports: list[dict[str, Any]]) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
-
