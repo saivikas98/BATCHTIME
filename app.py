@@ -6,6 +6,7 @@ import hashlib
 import gc
 from collections import OrderedDict
 from typing import Any
+from filling_merge import consolidate_filling_reports
 
 import streamlit as st
 
@@ -617,6 +618,7 @@ def main() -> None:
         status.info("Grouping report parts by batch number and merging operations...")
         log = pd.DataFrame(log_rows).sort_values(["Batch", "File"]).reset_index(drop=True)
         actual = combine_reports(reports)
+        actual = consolidate_filling_reports(actual)
         merged_datalog = build_merged_datalog_preview(reports)
 
         # Store only the merged compact outputs. Do not store raw PDFs and do
