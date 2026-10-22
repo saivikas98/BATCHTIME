@@ -802,5 +802,4 @@ def combine_reports(reports: list[dict[str, Any]]) -> pd.DataFrame:
         .sort_values(["Batch", "Process Start", "Stage", "Machine"])
         .reset_index(drop=True)
     )
-    
 
